@@ -1,0 +1,20 @@
+# virtual environments
+.venv/
+venv/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# benchmark output and local model copies
+results/*
+!results/README.md
+models/
+
+# caches
+.cache/
+.pytest_cache/
+.DS_Store

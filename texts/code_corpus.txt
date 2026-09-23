@@ -1,0 +1,2910 @@
+# ---- bench/__init__.py
+
+
+# ---- bench/common.py
+"""Shared helpers for the benchmark scripts: real-activation capture, lazy-queue timing,
+the byte model of the down projection, and the common run-record fields."""
+import base64
+import json
+import os
+import re
+import subprocess
+import time
+
+import mlx.core as mx
+import numpy as np
+
+from nsd.runtime import record_meta  # noqa: F401  (re-exported for the bench scripts)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+D = 2688
+ROW_B = D // 2               # nibble bytes of one neuron's down row (D/2)
+GRP_B = 2 * 2 * D            # bf16 scales + bf16 biases of one 64-neuron group, D outputs each
+GS = 64
+
+
+def gpu_core_count():
+    """The GPU's core count, from IOKit (mx.device_info does not report it)."""
+    try:
+        out = subprocess.run(["ioreg", "-r", "-c", "IOAccelerator", "-d", "1"],
+                              capture_output=True, text=True, timeout=10).stdout
+        m = re.search(r'"core-count"\s*=\s*(\d+)', out)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+
+def moby_ids(model, n, skip=2000):
+    """Token ids for a literature continuation: bos + n-1 tokens of Moby Dick from `skip`."""
+    text = open(os.path.join(ROOT, "texts", "moby_dick.txt"), encoding="utf-8", errors="replace").read()
+    ids = model.tokenizer.encode(text, add_special_tokens=False)
+    return [1] + list(ids[skip:skip + n - 1])
+
+
+def chain_ms(fn, n, reps=5, warm=2):
+    """GPU ms of one call of fn, measured the way the decode loop runs: n calls queued
+    lazily and evaluated once, best of `reps` repeats after `warm` warm-up queues."""
+    for _ in range(warm):
+        mx.eval(fn())
+    best = float("inf")
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        outs = [fn() for _ in range(n)]
+        mx.eval(*outs)
+        best = min(best, (time.perf_counter() - t0) / n)
+    return 1e3 * best
+
+
+def capture_moe_inputs(model, ids, cache=None, chunk=2048):
+    """Run a full prefill pass and capture the residual stream entering every MoE layer.
+    -> {layer: x [T, D]}; the blocks still run normally through the model. Pass a `cache`
+    to fill it with the real context as a side effect (the step-breakdown benchmark needs
+    the attention / Mamba caches warm when it times decode-like passes)."""
+    caps = {}
+    for l in model.moe_layers:
+        blk = model.blocks[l]
+        orig = blk.prefill                      # the bound method, captured before shadowing
+
+        def pf(x, orig=orig, l=l):
+            caps[l] = x
+            return orig(x)
+
+        blk.prefill = pf
+    model.prefill(mx.array(ids, dtype=mx.int32), cache or model.make_cache(), chunk=chunk)
+    for l in model.moe_layers:
+        del model.blocks[l].prefill              # back to the class method
+    for x in caps.values():
+        mx.eval(x)
+    return caps
+
+
+def byte_model(live_rows, live_groups, n_slots, width):
+    """Bytes of the down projection actually read vs the dense total, for n_slots experts
+    of `width` neurons given the mean live row / live 64-group counts."""
+    sparse = live_rows * ROW_B + live_groups * GRP_B
+    dense = n_slots * (width * ROW_B + width / GS * GRP_B)
+    return sparse, dense
+
+
+def append_json(path, record):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    hist = json.load(open(path)) if os.path.exists(path) else []
+    hist.append(record)
+    json.dump(hist, open(path, "w"), indent=1)
+
+
+def live_stats(h, width):
+    """h [width] after ReLU2 -> (live rows, live 64-groups, live fraction, live group fraction)."""
+    rows = (h != 0)
+    groups = rows.reshape(-1, GS).any(-1)
+    return dict(rows=float(rows.sum()), groups=float(groups.sum()),
+                rows_frac=float(rows.mean()), groups_frac=float(groups.mean()))
+
+
+def pack_masks_b64(masks):
+    """A boolean [n, width] live-mask -> one base64 string, ceil(width/8) bytes per row,
+    bit k of byte j standing for element 8j + k of the row, low bit first."""
+    packed = np.packbits(np.asarray(masks, dtype=bool), axis=-1, bitorder="little")
+    return base64.b64encode(packed.tobytes()).decode("ascii")
+
+# ---- bench/decode_layers.py
+"""Per-layer decode benchmark on real activations: what one decode token costs in each
+piece of every one of the 23 MoE layers, and what the down-projection row skip is worth.
+
+Protocol: Moby Dick (2048 tokens) is run through the full model once, capturing each MoE
+layer's input residual stream; 32 positions per layer are taken. Per layer, compiled
+functions are timed with calls queued lazily over the 32 positions and evaluated once,
+best of 5 repeats -- the way the decode loop actually runs, weights cold like a real step.
+
+Measured per layer, per token:
+  router       norm + gate + top-k selection
+  up           the stock sorted up projections + ReLU2 (routed and shared)
+  down dense   MLX's own gather_qmm down on the checkpoint layout
+  down sparse  our kernel over the live rows on the neuron-major layout
+  down sparse, dense h   the CONTROL: the identical kernel and launch, fed an h with no
+               zeros in it (every element nudged to a small positive constant), which
+               separates "a faster kernel" from "bytes not read"
+  block dense / block sparse   the whole MoE block, both modes
+
+Also per layer: the live fraction of neurons and of 64-neuron groups after ReLU2 (routed
+and shared), the byte model (dense bytes vs bytes actually read), and the relative error
+of the sparse result against MLX's dense down on the same inputs.
+
+  python -m bench.decode_layers                          # all 23 MoE layers
+  python -m bench.decode_layers --layers 1,10,22,51
+  python -m bench.decode_layers --story 10               # also export the storyboard JSON
+"""
+import argparse
+import json
+import os
+import time
+
+import mlx.core as mx
+import numpy as np
+
+from nsd.model import DECODE_KW, NemotronModel, relu2
+from nsd.decode import sparse_down
+from nsd.resolve import DEFAULT_MODEL_ID
+
+from bench.common import (GS, GRP_B, ROW_B, append_json, byte_model, capture_moe_inputs,
+                          gpu_core_count, moby_ids, record_meta)
+
+NTOK = 2048
+NPOS = 32
+LOOPS = 8                    # passes over the positions per timed queue
+REPS = 5
+CORE_COUNT = gpu_core_count()
+
+
+def rot_ms(f, args_list, loops=LOOPS, reps=REPS, warm=2):
+    """GPU ms per call, calls rotating over args_list (so consecutive calls touch different
+    experts' weights, like a real step), loops passes queued lazily and evaluated once,
+    best of `reps`."""
+    n = loops * len(args_list)
+    for _ in range(warm):
+        mx.eval(f(*args_list[0]))
+    best = float("inf")
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        outs = [f(*args_list[i % len(args_list)]) for i in range(n)]
+        mx.eval(*outs)
+        best = min(best, (time.perf_counter() - t0) / n)
+    return 1e3 * best
+
+
+def q8(v):
+    """|h| quantised to 8 bits with a square-root scale, so 0 stays exactly 0."""
+    v = np.asarray(v, dtype=np.float64)
+    m = v.max()
+    return [int(round(255 * np.sqrt(x / m))) if m > 0 and x > 0 else 0 for x in v]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=DEFAULT_MODEL_ID, help="local path or HF repo id")
+    ap.add_argument("--layers", default="all", help="comma list of MoE layer indices, or 'all'")
+    ap.add_argument("--story", default="", help="comma list of layers to export a storyboard JSON for (default: none)")
+    ap.add_argument("--out", default="results/decode_layers.json")
+    a = ap.parse_args()
+    story = {int(s) for s in a.story.split(",") if s}
+
+    dev = mx.device_info()
+    print(f"{dev.get('device_name')}, {CORE_COUNT} cores, mlx {mx.__version__}", flush=True)
+    t0 = time.time()
+    model = NemotronModel(a.model, mode="sparse", verbose=False, single_layout=False)   # both layouts: the bench compares them
+    print(f"model loaded, both down layouts resident ({mx.get_active_memory() / 1e9:.1f} GB active)", flush=True)
+    caps = capture_moe_inputs(model, moby_ids(model, NTOK))
+    print(f"captured {len(caps)} MoE layers on a {NTOK}-token pass ({time.time() - t0:.0f}s)", flush=True)
+    positions = list(range(0, NTOK, NTOK // NPOS))[:NPOS]
+
+    moe_layers = model.moe_layers if a.layers == "all" else [int(s) for s in a.layers.split(",")]
+    res = {}
+    print(f"\nper decode token, {NPOS} real positions, queued ({LOOPS} passes, best of {REPS}):")
+    print("| layer | live routed | live shared | live 64-grp | down bytes read | router | up | down dense | down sparse | "
+          "same, dense h | block dense | block sparse | err |")
+    print("|---|" + "---|" * 12)
+
+    for l in moe_layers:
+        blk = model.blocks[l]
+        b = blk.block.mixer
+        X = caps[l]
+        args_block = [(X[p:p + 1],) for p in positions]
+        # the real router / up / pack outputs at the 32 positions
+        fronts, packs = [], []
+        for p in positions:
+            f = blk.front(X[p:p + 1])
+            fronts.append(f)
+            packs.append(blk.pack(*f))
+        mx.eval(*[f[2] for f in fronts], *[p[0] for p in packs])
+
+        # live statistics and the byte model (means over the positions)
+        stats_r = [dict(rows=0.0, groups=0.0) for _ in range(blk.topk)]
+        stats_s = dict(rows=0.0, groups=0.0)
+        for f in fronts:
+            h, hs = f[2], f[3]                       # [1, K, 1, F] and [1, FS]
+            hs_ = hs.reshape(-1, GS)
+            stats_s["rows"] += float((hs != 0).sum())
+            stats_s["groups"] += float(hs_.any(-1).sum())
+            for k in range(blk.topk):
+                hk = h[0, k, 0]
+                stats_r[k]["rows"] += float((hk != 0).sum())
+                stats_r[k]["groups"] += float((hk.reshape(-1, GS)).any(-1).sum())
+        n = len(positions)
+        rows_r = sum(s["rows"] for s in stats_r) / n
+        grp_r = sum(s["groups"] for s in stats_r) / n
+        rows_s = stats_s["rows"] / n
+        grp_s = stats_s["groups"] / n
+        read_r, dense_r = byte_model(rows_r, grp_r, blk.topk, blk.F)
+        read_s, dense_s = byte_model(rows_s, grp_s, 1, blk.FS)
+        sparse_mb, dense_mb = (read_r + read_s) / 1e6, (dense_r + dense_s) / 1e6
+
+        # correctness of the sparse result against MLX's own dense down, same inputs
+        err = 0.0
+        for f, p in zip(fronts, packs):
+            h, hs, inds, scores = f[2], f[3], f[0], f[1]
+            y = b.switch_mlp.fc2(h, inds)
+            ref = (y.squeeze(-2) * scores[..., None].astype(y.dtype)).sum(-2) + b.shared_experts.down_proj(hs)
+            out = sparse_down(p[0], p[1], p[2], *blk.w_routed, *blk.w_shared,
+                              F=blk.F, FS=blk.FS, D=blk.D, topk=blk.topk, **DECODE_KW)
+            ref, out = ref.astype(mx.float32), out.astype(mx.float32)
+            mx.eval(ref, out)
+            err = max(err, float((out - ref).abs().max() / ref.abs().max()))
+
+        # the timed functions (compiled; the whole block both ways, and the pieces)
+        f_router = mx.compile(lambda x: b.gate(blk.block.norm(x)))
+        f_up = mx.compile(lambda x, inds: (relu2(mx.gather_qmm(
+            blk.block.norm(x)[:, None, None, :], b.switch_mlp.fc1.weight, b.switch_mlp.fc1.scales,
+            b.switch_mlp.fc1.biases, rhs_indices=inds, transpose=True,
+            group_size=b.switch_mlp.fc1.group_size, bits=b.switch_mlp.fc1.bits)),
+            relu2(b.shared_experts.up_proj(blk.block.norm(x)))))
+        f_down_dense = mx.compile(lambda h, hs, inds, scores: (
+            b.switch_mlp.fc2(h, inds).squeeze(-2) * scores[..., None].astype(h.dtype)).sum(-2)
+            + b.shared_experts.down_proj(hs))
+        f_down_sparse = mx.compile(lambda hcat, sel, gains: sparse_down(
+            hcat, sel, gains, *blk.w_routed, *blk.w_shared, F=blk.F, FS=blk.FS, D=blk.D,
+            topk=blk.topk, **DECODE_KW))
+        f_block_dense = model.blocks[l].decode_fn("dense")
+        f_block_sparse = model.blocks[l].decode_fn("sparse")
+
+        args_router = [(X[p:p + 1],) for p in positions]
+        args_up = [(X[p:p + 1], fronts[i][0]) for i, p in enumerate(positions)]
+        args_down = [(fronts[i][2], fronts[i][3], fronts[i][0], fronts[i][1]) for i in range(n)]
+        args_pack = [(packs[i][0], packs[i][1], packs[i][2]) for i in range(n)]
+        # the control: the same kernel, the same launch, an h with nothing to skip
+        dense_h = []
+        for p in packs:
+            h = mx.maximum(p[0], mx.array(1e-3, dtype=p[0].dtype))
+            dense_h.append((h, p[1], p[2]))
+        mx.eval(*[t[0] for t in dense_h])
+
+        r = dict(layer=l,
+                 live_routed_frac=rows_r / (blk.topk * blk.F), live_shared_frac=rows_s / blk.FS,
+                 live_group_frac_routed=grp_r / (blk.topk * blk.F / GS),
+                 live_group_frac_shared=grp_s / (blk.FS / GS),
+                 live_rows_per_token=dict(routed=rows_r, shared=rows_s),
+                 live_groups_per_token=dict(routed=grp_r, shared=grp_s),
+                 dense_down_mb=dense_mb, sparse_down_mb=sparse_mb,
+                 down_bytes_pct=100 * sparse_mb / dense_mb,
+                 router_ms=rot_ms(f_router, args_router),
+                 up_ms=rot_ms(f_up, args_up),
+                 down_dense_ms=rot_ms(f_down_dense, args_down),
+                 down_sparse_ms=rot_ms(f_down_sparse, args_pack),
+                 down_sparse_dense_h_ms=rot_ms(f_down_sparse, dense_h),
+                 block_dense_ms=rot_ms(f_block_dense, args_block),
+                 block_sparse_ms=rot_ms(f_block_sparse, args_block),
+                 rel_err_vs_mlx_dense=err)
+        res[str(l)] = r
+        print(f"| {l} | {100 * r['live_routed_frac']:.1f}% | {100 * r['live_shared_frac']:.1f}% | "
+              f"{100 * (grp_r + grp_s) / (blk.topk * blk.F / GS + blk.FS / GS):.1f}% | "
+              f"{r['down_bytes_pct']:.1f}% ({sparse_mb:.1f} of {dense_mb:.1f} MB) | "
+              f"{r['router_ms']:.3f} | {r['up_ms']:.3f} | {r['down_dense_ms']:.3f} | {r['down_sparse_ms']:.3f} | "
+              f"{r['down_sparse_dense_h_ms']:.3f} | {r['block_dense_ms']:.3f} | {r['block_sparse_ms']:.3f} | "
+              f"{err:.1e} |", flush=True)
+
+        # ---- the storyboard: the median-live position, masks and |h| per expert
+        if l in story:
+            live = [float((p[0] != 0).mean().item()) for p in packs]
+            ti = int(np.argsort(live)[len(live) // 2])
+            hcat = np.asarray(packs[ti][0].astype(mx.float32))[0]
+            hs = hcat[blk.topk * blk.F:]
+            hr = hcat[:blk.topk * blk.F].reshape(blk.topk, blk.F)
+            sel_i = np.asarray(packs[ti][1])[0].tolist()
+            scores = np.asarray(fronts[ti][1].astype(mx.float32))[0].tolist()
+            sh_rows = float((hs != 0).sum())
+            sh_grp = float((hs.reshape(-1, GS) != 0).any(-1).sum())
+            sl, nds = blk.decode_kw["sl"], blk.decode_kw["nds"]     # the kernel's partition at this layer
+            story_out = dict(
+                layer=l, token_index=ti, prompt_position=positions[ti],
+                D=blk.D, F=blk.F, FS=blk.FS, topk=blk.topk, n_experts=blk.E,
+                selected_experts=sel_i, routing_scores=scores,
+                shared=dict(live_pct=100 * float((hs != 0).mean()),
+                            live_rows=sh_rows, live_groups=sh_grp,
+                            dense_mb=(blk.FS * ROW_B + blk.FS / GS * GRP_B) / 1e6,
+                            sparse_mb=(sh_rows * ROW_B + sh_grp * GRP_B) / 1e6,
+                            h_q8=q8(hs)),
+                routed=[dict(expert=int(sel_i[k]), live_pct=100 * float((hr[k] != 0).mean()), h_q8=q8(hr[k]))
+                        for k in range(blk.topk)],
+                byte_model=dict(row_bytes=ROW_B, group_bytes=GRP_B, group_size=GS),
+                kernel_partition=dict(slice_neurons=sl, output_chunks=nds,
+                                      slices_per_routed_expert=blk.F // sl,
+                                      slices_per_shared_expert=blk.FS // sl,
+                                      threadgroups_per_token=(blk.topk * (blk.F // sl) + blk.FS // sl) * nds),
+                gpu_core_count=CORE_COUNT,
+                timings_ms={k: v for k, v in r.items() if k.endswith("_ms")},
+            )
+            path = os.path.join(os.path.dirname(a.out) or ".", f"storyboard_layer{l:02d}.json")
+            json.dump(story_out, open(path, "w"), indent=1)
+            print(f"   storyboard -> {path}: token {ti}, shared live "
+                  f"{story_out['shared']['live_pct']:.1f}% ({sh_rows:.0f} rows, {sh_grp:.0f} groups), "
+                  f"reads {story_out['shared']['sparse_mb']:.2f} of {story_out['shared']['dense_mb']:.2f} MB", flush=True)
+
+    if len(res) == len(model.moe_layers):
+        keys = ("router_ms", "up_ms", "down_dense_ms", "down_sparse_ms", "down_sparse_dense_h_ms",
+                "block_dense_ms", "block_sparse_ms")
+        S = {k: sum(r[k] for r in res.values()) for k in keys}
+        S["dense_down_mb"] = sum(r["dense_down_mb"] for r in res.values())
+        S["sparse_down_mb"] = sum(r["sparse_down_mb"] for r in res.values())
+        S["mean_down_bytes_pct"] = float(np.mean([r["down_bytes_pct"] for r in res.values()]))
+        res["sum"] = S
+        print(f"\nsum over {len(model.moe_layers)} MoE layers (ms per decode token): "
+              + ", ".join(f"{k} {v:.3f}" for k, v in S.items() if k.endswith("_ms")))
+        print(f"down bytes actually read: {S['mean_down_bytes_pct']:.1f}% of dense "
+              f"({S['sparse_down_mb']:.0f} of {S['dense_down_mb']:.0f} MB per token)")
+
+    res["layer_types"] = list(model.types)      # per layer index: mamba / attention / moe
+    res["device"] = dev.get("device_name")
+    res["meta"] = dict(record_meta(), core_count=CORE_COUNT, model=a.model,
+                       prompt_tokens=NTOK, positions=NPOS, loops=LOOPS, reps=REPS,
+                       decode_kw=dict(DECODE_KW), time=time.strftime("%Y-%m-%d %H:%M:%S"))
+    append_json(a.out, res)
+    print(f"wrote {a.out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- bench/e2e_prefill.py
+"""End-to-end prefill: dense (stock checkpoint layout) vs sparse (single neuron-major
+layout, matrix-unit kernel) on real literature, at several prompt lengths, with a few
+decode tokens after. ONE configuration per process (the GPU must not run two at once):
+
+  python -m bench.e2e_prefill --down sparse --prompt-tokens 2048
+  bench/run_prefill_matrix.sh                 # runs every cell sequentially, with a cooldown
+"""
+import argparse
+import time
+
+import mlx.core as mx
+
+from nsd.model import NemotronModel
+from nsd.resolve import DEFAULT_MODEL_ID
+
+from bench.common import append_json, moby_ids, record_meta
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=DEFAULT_MODEL_ID, help="local path or HF repo id")
+    ap.add_argument("--down", choices=("dense", "sparse"), default="sparse")
+    ap.add_argument("--prompt-tokens", type=int, default=2048)
+    ap.add_argument("--gen-tokens", type=int, default=8)
+    ap.add_argument("--chunk", type=int, default=2048)
+    ap.add_argument("--skip", type=int, default=2000, help="first Moby Dick token to read")
+    ap.add_argument("--tag", default=None)
+    ap.add_argument("--out", default="results/e2e_prefill.json")
+    a = ap.parse_args()
+
+    dev = mx.device_info()
+    print(f"loading ({a.down} down) ...", flush=True)
+    model = NemotronModel(a.model, mode=a.down, verbose=True)
+    active_after_load = mx.get_active_memory() / 1e9
+    ids = moby_ids(model, a.prompt_tokens, skip=a.skip)
+
+    mx.reset_peak_memory()
+    t0 = time.perf_counter()
+    cache = model.make_cache()
+    h = model.prefill(mx.array(ids, dtype=mx.int32), cache, a.chunk)
+    mx.eval(h)
+    prefill_s = time.perf_counter() - t0
+    peak_prefill = mx.get_peak_memory() / 1e9
+    print(f"[{a.down} {a.prompt_tokens} tok] prefill {len(ids)} tok in {prefill_s:.2f}s "
+          f"({len(ids) / prefill_s:.0f} tok/s) | active after load {active_after_load:.2f} GB | "
+          f"peak {peak_prefill:.2f} GB", flush=True)
+
+    stats = None
+    for t, st in model.generate(ids, a.gen_tokens, 0.0, chunk=a.chunk, cache=cache):
+        if st is not None:
+            stats = st
+    print(f"  + {a.gen_tokens} decode tokens: {stats['decode_tps']:.1f} tok/s", flush=True)
+
+    record = dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), tag=a.tag or f"{a.down}-{a.prompt_tokens}",
+                  down=a.down, prompt_tokens=len(ids), prompt_s=prefill_s,
+                  prompt_tps=len(ids) / prefill_s, active_after_load_gb=active_after_load,
+                  peak_prefill_gb=peak_prefill, peak_gb=stats["peak_gb"],
+                  decode_tps=stats["decode_tps"], chunk=a.chunk,
+                  model=a.model, **record_meta())
+    append_json(a.out, record)
+    print(f"appended to {a.out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- bench/prefill_layers.py
+"""Per-layer prefill benchmark: the matrix-unit sparse down kernel against MLX's own dense
+down on the stock layout, per MoE layer, on a 2048-token chunk of real activations (Moby
+Dick through the full model). The sparse timing includes everything the e2e path pays:
+the tile order, the union compaction and the gather, all on the GPU.
+
+Also, the cost of the alternatives that motivate having a prefill kernel on the same
+layout as decode at all:
+  (a) the time to build the neuron-major layout for all 23 layers -- what "transpose the
+      weights for every prompt" would cost per prompt
+  (b) the memory of keeping both layouts resident against one
+
+With --story (default layer 10, comma list for more) each chosen layer also exports a
+prefill storyboard JSON: how the router split the chunk over the 128 experts, the live
+masks of one typical expert's tokens (base64-packed bits), and the union shares that drive
+the kernel's tile GEMM.
+
+  python -m bench.prefill_layers                       # all 23 MoE layers
+  python -m bench.prefill_layers --layers 1,10,22,51
+"""
+import argparse
+import json
+import os
+import time
+
+import mlx.core as mx
+import numpy as np
+
+from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
+
+from nsd.model import PREFILL_KW, NemotronModel, relu2
+from nsd.prefill import build_tiles, build_union, sparse_down_prefill
+from nsd.resolve import DEFAULT_MODEL_ID
+
+from bench.common import (append_json, capture_moe_inputs, moby_ids, pack_masks_b64,
+                          record_meta)
+
+NTOK = 2048
+REPS = 3          # timed queues, best of
+CALLS = 3         # calls queued lazily per queue
+
+
+def timeit(fn, reps=REPS, calls=CALLS, warm=2):
+    for _ in range(warm):
+        mx.eval(fn())
+    best = float("inf")
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        outs = [fn() for _ in range(calls)]
+        mx.eval(*outs)
+        best = min(best, (time.perf_counter() - t0) / calls)
+    return 1e3 * best
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=DEFAULT_MODEL_ID, help="local path or HF repo id")
+    ap.add_argument("--layers", default="all")
+    ap.add_argument("--story", default="10", help="comma list of layers to export a prefill storyboard JSON for")
+    ap.add_argument("--out", default="results/prefill_layers.json")
+    a = ap.parse_args()
+    story = {int(s) for s in a.story.split(",") if s}
+    dev = mx.device_info()
+    print(f"{dev.get('device_name')}, mlx {mx.__version__}", flush=True)
+
+    # ---- (a) the layout build for all 23 layers, and (b) both layouts against one
+    model = NemotronModel(a.model, mode="dense", verbose=False, single_layout=False)   # nothing converted yet
+    active_one = mx.get_active_memory() / 1e9
+    t0 = time.time()
+    for l in model.moe_layers:
+        model.blocks[l].build_layout(drop_stock=False)                         # keep the stock layout
+    build_s = time.time() - t0
+    active_both = mx.get_active_memory() / 1e9
+    down_bytes = sum(b.nbytes for l in model.moe_layers
+                     for b in (model.blocks[l].pw, model.blocks[l].ps, model.blocks[l].pb,
+                               model.blocks[l].spw, model.blocks[l].sps, model.blocks[l].spb))
+    print(f"one layout {active_one:.2f} GB active | neuron-major build for {len(model.moe_layers)} layers "
+          f"{build_s:.1f}s | both layouts {active_both:.2f} GB active (down projections {down_bytes / 1e9:.2f} GB)",
+          flush=True)
+
+    model.set_mode("sparse")      # layouts already built; stock stays (single_layout was False)
+    caps = capture_moe_inputs(model, moby_ids(model, NTOK))
+    print(f"captured {len(caps)} MoE layers on a {NTOK}-token pass", flush=True)
+
+    moe_layers = model.moe_layers if a.layers == "all" else [int(s) for s in a.layers.split(",")]
+    res = {}
+    print(f"\n{NTOK}-token chunk, real activations; ms per layer (best of {REPS} x {CALLS} queued):")
+    print("| layer | tt | live rows | union of tiles | down dense (stock) | down sparse (matrix-unit) | ratio | "
+          "rel err | block stock | block sparse |")
+    print("|---|" + "---|" * 10)
+
+    for l in moe_layers:
+        blk = model.blocks[l]
+        b = blk.block.mixer
+        x = caps[l]
+        xn = blk.block.norm(x)
+        inds, scores = b.gate(xn)
+        xs, idx, inv = _gather_sort(xn[:, None, None, :], inds)
+        hsort = relu2(b.switch_mlp.fc1(xs, idx, sorted_indices=True))
+        h = _scatter_unsort(hsort, inv, inds.shape).squeeze(-2)
+        hs = relu2(b.shared_experts.up_proj(xn))
+        hcat, sel, gains = blk.pack(inds, scores, h, hs)
+        mx.eval(hsort, h, hs, hcat, sel, gains, idx, inv)
+        live = float((hcat != 0).mean().item())
+        kw = dict(blk.prefill_kw)
+
+        def down_stock():
+            y = _scatter_unsort(b.switch_mlp.fc2(hsort, idx, sorted_indices=True), inv, inds.shape).squeeze(-2)
+            return (y * scores[..., None].astype(y.dtype)).sum(-2) + b.shared_experts.down_proj(hs)
+
+        def down_sparse():
+            tiles = build_tiles(sel, blk.E, kw["tt"])
+            union = build_union(hcat, tiles[0], tiles[1], F=blk.F, FS=blk.FS, topk=blk.topk,
+                                E=blk.E, tt=kw["tt"], kc=kw["kc"])
+            return sparse_down_prefill(hcat, sel, gains, *blk.w_routed, *blk.w_shared,
+                                       F=blk.F, FS=blk.FS, D=blk.D, topk=blk.topk, E=blk.E,
+                                       tiles=tiles, union=union, **kw)
+
+        tiles = build_tiles(sel, blk.E, kw["tt"])
+        union = build_union(hcat, tiles[0], tiles[1], F=blk.F, FS=blk.FS, topk=blk.topk,
+                            E=blk.E, tt=kw["tt"], kc=kw["kc"])
+        mx.eval(*union)
+        valid = tiles[0] >= 0
+        width = mx.where(tiles[0] >= blk.E, blk.FS, blk.F)
+        ufrac = float((union[1] * valid).sum() / (width * valid).sum())
+        ref = down_stock().astype(mx.float32)
+        out = down_sparse().astype(mx.float32)
+        mx.eval(ref, out)
+        err = float((out - ref).abs().max() / ref.abs().max())
+        t_stock, t_sparse = timeit(down_stock), timeit(down_sparse)
+        t_blk_stock = timeit(lambda: blk.block(x[None])[0])
+        t_blk_sparse = timeit(lambda: blk.prefill_sparse(x))
+        r = dict(layer=l, tile_slots=kw["tt"], live=live, union_frac=ufrac,
+                 down_dense_ms=t_stock, down_sparse_ms=t_sparse, ratio=t_stock / t_sparse,
+                 rel_err=err, block_stock_ms=t_blk_stock, block_sparse_ms=t_blk_sparse)
+        res[str(l)] = r
+        print(f"| {l} | {kw['tt']} | {100 * live:.1f}% | {100 * ufrac:.0f}% | {t_stock:.1f} | {t_sparse:.1f} | "
+              f"{t_stock / t_sparse:.2f}x | {err:.1e} | {t_blk_stock:.1f} | {t_blk_sparse:.1f} |", flush=True)
+
+        # ---- the prefill storyboard: the router split, one typical expert's live masks, the union shares
+        if l in story:
+            T = h.shape[0]
+            h_np = np.asarray(h.astype(mx.float32))            # [T, topk, F] after ReLU2, token order
+            hs_np = np.asarray(hs.astype(mx.float32))         # [T, FS]
+            sel_np = np.asarray(sel).astype(np.int64)          # [T, topk]
+            counts = np.bincount(sel_np.reshape(-1), minlength=blk.E)     # tokens per routed expert
+            avg = T * blk.topk / blk.E
+            e = int(np.argmin(np.abs(counts.astype(float) - avg)))        # the most average-loaded expert
+            occ = sel_np == e
+            toks = np.nonzero(occ.any(axis=1))[0]                         # its tokens, chunk order
+            ks = np.argmax(occ[toks], axis=1)                              # the slot each one routed in
+            masks = h_np[toks, ks] != 0                                    # [n, F] live masks, chunk order
+            tt = kw["tt"]
+            per_tile = [float(masks[i:i + tt].any(axis=0).mean()) for i in range(0, len(toks), tt)]
+            story_out = dict(
+                layer=l, chunk_tokens=T, tile_slots=tt,
+                D=blk.D, F=blk.F, FS=blk.FS, topk=blk.topk, n_experts=blk.E,
+                expert_token_counts=counts.tolist(),
+                follow=dict(
+                    expert=e, tokens=int(counts[e]), average_tokens=avg,
+                    mask_rows=int(len(toks)), mask_bytes_per_row=(blk.F + 7) // 8,
+                    live_mask_b64=pack_masks_b64(masks),
+                    mean_live_per_token=float(masks.mean()),
+                    union_over_all_tokens=float(masks.any(axis=0).mean()),
+                    union_share_per_tile=per_tile),
+                shared_union_over_chunk=float((hs_np != 0).any(axis=0).mean()),
+                kernel_union_share=ufrac,
+            )
+            path = os.path.join(os.path.dirname(a.out) or ".", f"storyboard_prefill_layer{l:02d}.json")
+            json.dump(story_out, open(path, "w"), indent=1)
+            print(f"   storyboard -> {path}: expert {e} carries {int(counts[e])} tokens "
+                  f"(average {avg:.1f}), live {100 * story_out['follow']['mean_live_per_token']:.1f}% per token, "
+                  f"union {100 * story_out['follow']['union_over_all_tokens']:.1f}% over all its tokens, "
+                  f"per-tile union {100 * min(per_tile):.0f}-{100 * max(per_tile):.0f}%", flush=True)
+
+    if len(res) == len(model.moe_layers):
+        keys = ("down_dense_ms", "down_sparse_ms", "block_stock_ms", "block_sparse_ms")
+        S = {k: sum(r[k] for r in res.values()) for k in keys}
+        S["mean_live"] = float(np.mean([r["live"] for r in res.values()]))
+        S["mean_union_frac"] = float(np.mean([r["union_frac"] for r in res.values()]))
+        res["sum"] = S
+        print(f"\nsum over {len(model.moe_layers)} MoE layers: down dense {S['down_dense_ms']:.0f} ms, "
+              f"down sparse {S['down_sparse_ms']:.0f} ms, block stock {S['block_stock_ms']:.0f} ms, "
+              f"block sparse {S['block_sparse_ms']:.0f} ms per {NTOK}-token chunk")
+
+    # (b) again, now with the stock layout dropped at the end of the comparison
+    for l in model.moe_layers:
+        model.blocks[l].drop_stock()
+    mx.clear_cache()
+    active_after_drop = mx.get_active_memory() / 1e9
+    print(f"stock layout dropped after the comparison: {active_after_drop:.2f} GB active", flush=True)
+
+    res["layout"] = dict(build_seconds=build_s, layers=len(model.moe_layers),
+                         active_one_layout_gb=active_one, active_both_layouts_gb=active_both,
+                         active_one_layout_after_drop_gb=active_after_drop,
+                         down_projection_gb=down_bytes / 1e9)
+    res["meta"] = dict(record_meta(), model=a.model, prompt_tokens=NTOK,
+                       prefill_kw=dict(PREFILL_KW), time=time.strftime("%Y-%m-%d %H:%M:%S"))
+    append_json(a.out, res)
+    print(f"wrote {a.out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- bench/render_table.py
+"""Render the end-to-end decode matrix JSON (results/e2e_decode.json, written by
+bench/run_e2e_matrix.sh) into a markdown table: per prompt, tok/s per cell (dense / sparse
+x plain / MTP 2), MTP acceptance, prefill tok/s, peak GB.
+
+  python -m bench.render_table results/e2e_decode.json
+  python -m bench.render_table results/e2e_decode.json --out results/e2e_decode.md
+"""
+import argparse
+import json
+import sys
+
+CELLS = [("dense", 0, "dense"), ("sparse", 0, "sparse"),
+         ("dense", 2, "dense + MTP 2"), ("sparse", 2, "sparse + MTP 2")]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("json_file")
+    ap.add_argument("--out", default=None, help="write the markdown here instead of stdout")
+    a = ap.parse_args()
+    runs = json.load(open(a.json_file))
+
+    # group the records by prompt kind and cell; keep the latest record for each
+    by_prompt = {}
+    for r in runs:
+        key = (r.get("prompt_kind") or r.get("tag", "?"), r.get("prompt_tokens"))
+        by_prompt.setdefault(key, {})[(r.get("down"), r.get("mtp", 0))] = r
+
+    lines = []
+    dev = next((r.get("device") for r in runs if r.get("device")), "?")
+    mlx = next((r.get("mlx") for r in runs if r.get("mlx")), "?")
+    lines.append(f"End-to-end decode matrix ({dev}, MLX {mlx}), {len(runs)} runs.")
+    for (kind, ptoks), cells in by_prompt.items():
+        lines.append("")
+        lines.append(f"### {kind} ({ptoks} prompt tokens)")
+        lines.append("| cell | prefill tok/s | decode tok/s | ms/token | accepted drafts | peak GB |")
+        lines.append("|---|---|---|---|---|---|")
+        for down, mtp, label in CELLS:
+            r = cells.get((down, mtp))
+            if r is None:
+                lines.append(f"| {label} | - | - | - | - | - |")
+                continue
+            acc = (f"{r['spec']['accepted_mean']:.2f} of {mtp} (hist {r['spec']['accepted_hist']})"
+                   if r.get("spec") else "-")
+            lines.append(f"| {label} | {r['prompt_tps']:.0f} | {r['decode_tps']:.1f} | "
+                         f"{r['ms_per_token']:.2f} | {acc} | {r['peak_gb']:.1f} |")
+    text = "\n".join(lines) + "\n"
+    if a.out:
+        open(a.out, "w").write(text)
+        print(f"wrote {a.out}")
+    else:
+        sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- bench/step_breakdown.py
+"""The decode step broken down by block type, on a real ~4k context.
+
+Moby Dick is prefilled once; then the residual streams captured at the first MoE layer's
+positions are fed, one per pass, through all blocks of one kind in sequence -- the 23
+Mamba-2 blocks chained with their caches, the 6 attention blocks chained, the 23 MoE
+blocks chained in dense and in sparse mode, and lm_head + argmax once -- each timed as a
+chained pass over the real streams, cold and serial like the corresponding slice of a real
+step. Also the full 52-block step chained the same way, and a measured generation loop.
+
+A pass count of 24 or more is needed: short queues ride the GPU's boost clocks and read
+low (the full matrix at n=6 measured ~40% below n=24 on the same work), while a real
+decode step runs at the sustained clocks that a converged queue reproduces.
+
+The per-type chains measure each type IN ISOLATION; the block types interact in the full
+step (the two small sparse-down kernels of a MoE block overlap with the neighbouring
+blocks' large GEMMs), so the dense-to-sparse difference shows up in the full step chain
+and the measured loop, not necessarily in the isolated MoE chain. Both are reported.
+
+  python -m bench.step_breakdown [--ctx 4096] [--gen 64] [--passes 24]
+"""
+import argparse
+import time
+
+import mlx.core as mx
+
+from nsd.model import NemotronModel
+from nsd.resolve import DEFAULT_MODEL_ID
+
+from bench.common import append_json, capture_moe_inputs, chain_ms, moby_ids, record_meta
+
+NSTREAMS = 24              # real residual streams, one per chained pass
+
+
+def rotating(xs):
+    state = {"i": 0}
+
+    def next_x():
+        x = xs[state["i"] % len(xs)]
+        state["i"] += 1
+        return x
+    return next_x
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=DEFAULT_MODEL_ID, help="local path or HF repo id")
+    ap.add_argument("--ctx", type=int, default=4096)
+    ap.add_argument("--gen", type=int, default=64)
+    ap.add_argument("--passes", type=int, default=24)
+    ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--streams", type=int, default=NSTREAMS)
+    ap.add_argument("--out", default="results/step_breakdown.json")
+    a = ap.parse_args()
+    dev = mx.device_info()
+    print(f"{dev.get('device_name')}, mlx {mx.__version__}", flush=True)
+
+    model = NemotronModel(a.model, mode="dense", verbose=False, single_layout=False)
+    ids = moby_ids(model, a.ctx)
+    model._cache = model.make_cache()
+    caps = capture_moe_inputs(model, ids, cache=model._cache)   # the real context fills the caches
+    first_moe = model.moe_layers[0]
+    xs = [caps[first_moe][p:p + 1] for p in range(0, caps[first_moe].shape[0], a.ctx // a.streams)][:a.streams]
+    mx.eval(*xs)
+    print(f"prefilled {a.ctx} tokens, captured {len(xs)} real residual streams", flush=True)
+
+    res = dict(record_meta(), ctx=a.ctx, passes=a.passes, reps=a.reps, streams=len(xs),
+               model=a.model, time=time.strftime("%Y-%m-%d %H:%M:%S"))
+    counts = {t: sum(1 for v in model.types if v == t) for t in ("mamba", "attention", "moe")}
+    res["blocks"] = counts
+
+    for tag in ("dense", "sparse"):
+        if tag == "sparse":
+            model.set_mode(tag)
+        r = {}
+        for kind in ("mamba", "attention", "moe"):
+            layers = [l for l, t in enumerate(model.types) if t == kind]
+            next_x = rotating(xs)
+
+            def one(kind=kind, layers=layers, next_x=next_x):
+                h = next_x()
+                for l in layers:
+                    if kind == "moe":
+                        h = model.moe_fn[l](h)
+                    else:
+                        h = model.blocks[l](h[:, None, :], mask=None, cache=model._cache[l])[:, 0]
+                return h
+
+            r[f"chain_{kind}_ms"] = chain_ms(one, a.passes, reps=a.reps)
+        next_x = rotating(xs)
+        r["lm_head_argmax_ms"] = chain_ms(lambda: mx.argmax(model.logits(next_x()).astype(mx.float32), axis=-1),
+                                          a.passes, reps=a.reps)
+        next_x = rotating(xs)
+        r["step_chain_ms"] = chain_ms(lambda: model.step(next_x()), a.passes, reps=a.reps)
+        r["sum_chain_types_ms"] = (r["chain_mamba_ms"] + r["chain_attention_ms"]
+                                   + r["chain_moe_ms"] + r["lm_head_argmax_ms"])
+        last = None
+        for t, st in model.generate(ids, 8 + a.gen, 0.0, chunk=2048):
+            if st is not None:
+                last = st
+        r["loop_ms_per_token"] = last["ms_per_token"]
+        r["loop_tps"] = last["decode_tps"]
+        res[tag] = r
+        print(f"[{tag}] one pass of all blocks per type: mamba x{counts['mamba']} {r['chain_mamba_ms']:.2f} ms, "
+              f"attention x{counts['attention']} {r['chain_attention_ms']:.2f} ms, moe x{counts['moe']} "
+              f"{r['chain_moe_ms']:.2f} ms, lm_head+argmax {r['lm_head_argmax_ms']:.2f} ms | sum of types "
+              f"{r['sum_chain_types_ms']:.2f} | 52-block step chained {r['step_chain_ms']:.2f} ms | "
+              f"measured loop {r['loop_ms_per_token']:.2f} ms/tok ({r['loop_tps']:.1f} tok/s)", flush=True)
+
+    append_json(a.out, res)
+    print(f"wrote {a.out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- nsd/__init__.py
+"""Sparse down projection and MTP speculative decoding for NVIDIA's
+Nemotron 3.5 Lightning 30B A3B on MLX, from the stock mlx-community 4-bit checkpoint.
+
+Modules:
+    layout    the neuron-major permutation of the checkpoint's down projections
+    decode    the decode Metal kernel over the live rows
+    prefill   the prefill matrix-unit kernel (tile order, union, gather, GEMM)
+    mamba     multi-row Mamba-2 steps with rollback, for speculative decoding
+    mtp       NVIDIA's multi-token-prediction head as the drafter
+    model     the model wrapper and the generation loops (plain and MTP)
+    resolve   model / head resolution (LM Studio, HF cache, download)
+    cli       the command-line entry point (python -m nsd)
+"""
+
+__version__ = "0.1.0"
+
+# ---- nsd/__main__.py
+from .cli import main
+
+main()
+
+# ---- nsd/cli.py
+"""Command-line generation with the sparse down projection and MTP speculative decoding.
+
+Run from the repository root (results and texts resolve relative to it):
+
+  python -m nsd --prompt "Why are whales not fish?"                  # sparse down, greedy
+  python -m nsd --down dense --prompt "..."                           # stock mlx-lm blocks
+  python -m nsd --mtp 2 --prompt "..."                               # sparse + MTP, 2 drafts
+  python -m nsd --prompt-file texts/moby_dick.txt --prompt-tokens 2048 --max-tokens 256
+  python -m nsd --raw --prompt "Call me Ishmael."                    # no chat template
+
+One configuration per process: the GPU should never run two of these at once. Each run
+appends a record (device, versions, timings, tokens, MTP acceptance) to --json.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+import mlx.core as mx
+
+from .model import MODES, NemotronModel
+from .mtp import MTPHead
+from .resolve import DEFAULT_MTP_HEAD_ID, DEFAULT_MODEL_ID, resolve_head
+from .runtime import record_meta
+
+DEFAULT_PROMPT = "Write a short paragraph about why whales are not fish."
+CODE_PROMPT = ("Write a Python function merge_sorted(a, b) that merges two sorted lists into one "
+               "sorted list in linear time, then a few assert-based tests for it.")
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--model", default=DEFAULT_MODEL_ID, help="local path or HF repo id")
+    ap.add_argument("--down", choices=MODES, default="sparse", help="down projection (default: sparse)")
+    ap.add_argument("--mtp", type=int, default=0, help="MTP drafts per step (0 = off; 2 recommended)")
+    ap.add_argument("--mtp-head", default=DEFAULT_MTP_HEAD_ID, help="the MTP head: local path or HF repo id")
+    ap.add_argument("--prompt", default=None, help="the prompt text")
+    ap.add_argument("--prompt-code", action="store_true", help="use the built-in code prompt instead of --prompt")
+    ap.add_argument("--prompt-file", default=None, help="take the prompt from a text file")
+    ap.add_argument("--prompt-tokens", type=int, default=4096, help="prompt tokens to take from --prompt-file")
+    ap.add_argument("--raw", action="store_true", help="raw prompt (bos + tokens), no chat template")
+    ap.add_argument("--max-tokens", type=int, default=256)
+    ap.add_argument("--temp", type=float, default=0.0, help="sampling temperature (plain decode only; MTP is greedy)")
+    ap.add_argument("--chunk", type=int, default=2048, help="prefill chunk size")
+    ap.add_argument("--warmup", type=int, default=8, help="tokens generated and discarded before timing "
+                                                         "(the first steps pay for mx.compile of 23 MoE blocks)")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--tag", default=None, help="a label for the run record (benchmarks use this)")
+    ap.add_argument("--json", default=None, help="append the run record to this JSON file (e.g. results/generate.json)")
+    return ap
+
+
+def prompt_ids(a, model):
+    """The prompt token ids: chat template by default (mlx-lm's own renderer), or raw
+    bos + encoding with --raw / --prompt-file."""
+    tok = model.tokenizer
+    if a.prompt_file:
+        text = open(a.prompt_file, encoding="utf-8", errors="replace").read()
+        ids = tok.encode(text, add_special_tokens=False)[: a.prompt_tokens - 1]
+        return [1] + list(ids)
+    text = CODE_PROMPT if a.prompt_code else (a.prompt if a.prompt is not None else DEFAULT_PROMPT)
+    if a.raw:
+        return [1] + list(tok.encode(text, add_special_tokens=False))
+    messages = [{"role": "user", "content": text}]
+    return list(tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False))
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    model_path = a.model
+    print(f"model {model_path}\nloading ...", flush=True)
+    model = NemotronModel(model_path, mode=a.down)
+    cfg = json.load(open(os.path.join(model.path, "generation_config.json")))
+    eos = cfg.get("eos_token_id", 2)
+    a.eos = tuple(eos) if isinstance(eos, list) else (eos,)
+    mtp = None
+    if a.mtp:
+        head_dir = resolve_head(a.mtp_head)
+        print(f"MTP head {head_dir}", flush=True)
+        mtp = MTPHead(model, head_dir)
+        print(f"head loaded: {mtp.bytes / 1e6:.0f} MB of weights, {a.mtp} draft(s) per step", flush=True)
+        if a.temp != 0.0:
+            print("MTP speculative decoding is greedy; ignoring --temp", flush=True)
+            a.temp = 0.0
+
+    prompt = prompt_ids(a, model)
+
+    def gen(prompt_ids_, n):
+        """One generation of n tokens (the warm-up uses the warm-up count, not the run's)."""
+        return (model.generate_mtp(prompt_ids_, mtp, n_draft=a.mtp, max_tokens=n, eos=a.eos, chunk=a.chunk)
+                if a.mtp else model.generate(prompt_ids_, n, a.temp, a.eos, a.chunk))
+
+    if a.warmup:
+        t0 = time.perf_counter()
+        for _ in gen(prompt[:8] if len(prompt) >= 8 else prompt, a.warmup):
+            pass
+        print(f"warmup {a.warmup} tokens in {time.perf_counter() - t0:.1f}s (compile)", flush=True)
+
+    mx.reset_peak_memory()
+    stats = None
+    for t, st in gen(prompt, a.max_tokens):
+        if st is None:
+            if not a.quiet:
+                sys.stdout.write(model.tokenizer.decode([t]))
+                sys.stdout.flush()
+    if not a.quiet:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    stats = st
+    # the last token arrives with the stats, so decode from the stats' own token list
+    stats["text"] = model.tokenizer.decode([t for t in stats["tokens"] if t not in a.eos])
+
+    tag = a.tag or ("dense" if a.down == "dense" else "sparse") + (f"+mtp{a.mtp}" if a.mtp else "")
+    extra = ""
+    if a.mtp:
+        sp = stats["spec"]
+        extra = (f" | {sp['steps']} steps, {sp['ms_per_step']:.1f} ms/step, {sp['tokens_per_step']:.2f} tok/step"
+                 f" (accepted drafts {sp['accepted_mean']:.2f} of {a.mtp}; hist {sp['accepted_hist']})")
+    print(f"[{tag}] prompt {stats['prompt_tokens']} tok in {stats['prompt_s']:.2f}s ({stats['prompt_tps']:.0f} tok/s) | "
+          f"decode {stats['gen_tokens']} tok: {stats['decode_tps']:.1f} tok/s ({stats['ms_per_token']:.2f} ms/tok) | "
+          f"peak {stats['peak_gb']:.1f} GB{extra}", flush=True)
+
+    if a.json:
+        record = dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), tag=tag, model=model_path, down=a.down,
+                      mtp=a.mtp, raw=a.raw, prompt_file=a.prompt_file,
+                      prompt_kind=("code" if a.prompt_code else
+                                   (os.path.basename(a.prompt_file or "") or "chat") +
+                                   (f":{a.prompt_tokens}" if a.prompt_file else "")),
+                      chunk=a.chunk, max_tokens=a.max_tokens,
+                      load_seconds=model.load_seconds, **record_meta(), **stats)
+        os.makedirs(os.path.dirname(a.json) or ".", exist_ok=True)
+        hist = json.load(open(a.json)) if os.path.exists(a.json) else []
+        hist.append(record)
+        json.dump(hist, open(a.json, "w"), indent=1)
+        print(f"appended to {a.json}", flush=True)
+    return stats
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- nsd/decode.py
+"""Sparse MoE down projection for decode, as a Metal kernel on the neuron-major layout.
+
+The checkpoint's down projection is permuted once at load time (nsd.layout) so
+that one neuron's weights are one contiguous row. At decode the expert activation
+h is already materialised for the up projection, so a neuron whose ReLU2 output is
+exactly zero is known before any down bytes are touched: the kernel compacts the
+live rows with simd ballots and never reads a dead row, and reads a 64-neuron
+group's scales and biases only when at least one neuron of the group is live.
+
+One threadgroup = D/8/NDS threads (NDS chunks of the D outputs) x one slice of SL
+neurons of one routed expert or of the shared expert. Each thread owns one weight
+word, i.e. 8 of the D outputs, and walks the slice's live rows accumulating
+    out[n] += h[i] * nibble_n(W[i, 8w+n])
+per live 64-group, then applies the group's affine terms,
+    out[n] += scale[n] * acc[n] + bias[n] * sum(h over the group's live rows).
+SL must tile F and FS and be a multiple of 32 (1856 = 2^6 x 29 and 3712 admit
+32, 64, 928, 1856). A 64-group that straddles two slices is finished by both,
+each reading the group's scales once. Partial sums land in part[B, NS, D] (fp32)
+and a small reduce kernel sums the slices -- few, long slices keep that partial
+small, which is why the default slice is 928 neurons, not 64.
+
+With the defaults (sl=928, nds=3) a token costs 16 slices x 3 = 48 threadgroups:
+6 routed experts x 2 slices x 3, plus the shared expert's 4 slices x 3.
+
+`loadsc=0` skips the scale and bias loads; it exists only so a benchmark can
+measure what the group metadata traffic costs, and must not be used for real
+inference.
+"""
+import mlx.core as mx
+
+HEADER = """
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+"""
+
+KERNEL_SRC = """
+    // h [B, TOPK*F + FS] (T), sel [B, TOPK] int32, gains [B, TOPK+1] f32
+    // pw [E, F, D/8] u32, ps / pb [E, F/GS, D] (ST, neuron-major), spw [FS, D/8] u32,
+    // sps / spb [FS/GS, D] -> part [B, NS, D] f32
+    constexpr int GS   = 64;
+    constexpr int NW   = D / 8;                          // weight words per neuron row
+    constexpr int MAXG = SL / 32 + 1;                    // groups a slice can touch (partial at both ends)
+    constexpr int SPE  = F / SL;                         // slices per routed expert
+    constexpr int NSR  = TOPK * SPE;                     // routed slices, then the shared expert's
+    constexpr int NSS  = FS / SL;
+    constexpr int NS   = NSR + NSS;
+    constexpr int NR   = TOPK * F + FS;                  // columns of h
+    constexpr int TGW  = NW / NDS;                       // threads per threadgroup
+    static_assert(F % SL == 0 && FS % SL == 0 && SL % 32 == 0 && NW % NDS == 0,
+                  "slice must tile the experts, 32 rows at a time");
+    const int w    = (int)thread_position_in_grid.x;     // word index over the whole D
+    const int tid  = (int)thread_position_in_threadgroup.x;
+    const int s    = (int)threadgroup_position_in_grid.y;
+    const int bi   = (int)threadgroup_position_in_grid.z;
+    const int lane = (int)thread_index_in_simdgroup;
+    const int sgi  = (int)simdgroup_index_in_threadgroup;
+    if (s >= NS || w >= NW) return;
+
+    const device uint32_t* wb; const device ST* sb; const device ST* bb; const device T* hsrc;
+    float gain; int r0;
+    if (s < NSR) {                                      // a slice of routed expert slot `ei`
+        const int ei = s / SPE; r0 = (s % SPE) * SL;
+        const int e = sel[bi * TOPK + ei];
+        wb   = pw + ((size_t)e * F + r0) * NW;
+        sb   = ps + (size_t)e * (F / GS) * D + 8 * w;    // groups are addressed by their global index (grow)
+        bb   = pb + (size_t)e * (F / GS) * D + 8 * w;
+        hsrc = h + (size_t)bi * NR + ei * F + r0;
+        gain = gains[bi * (TOPK + 1) + ei];
+    } else {                                            // a slice of the shared expert
+        r0 = (s - NSR) * SL;
+        wb   = spw + (size_t)r0 * NW;
+        sb   = sps + 8 * w;
+        bb   = spb + 8 * w;
+        hsrc = h + (size_t)bi * NR + TOPK * F + r0;
+        gain = gains[bi * (TOPK + 1) + TOPK];
+    }
+
+    threadgroup float hs[SL];                           // the slice's slice of h
+    threadgroup short live[SL];                         // its live rows, compacted
+    threadgroup short gstart[MAXG + 1];                 // live-row prefix at each group boundary
+    threadgroup short grow[MAXG];                       // the group's global index
+    threadgroup short ngrp_tg;
+    for (int i = tid; i < SL; i += TGW) hs[i] = float(hsrc[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgi == 0) {                                     // one simdgroup compacts 32 rows at a time
+        int base = 0, ng = 0;
+        for (int k = 0; k < SL; k += 32) {
+            if (k == 0 || ((r0 + k) % GS) == 0) {       // a 64-group starts here (or the slice starts inside one)
+                if (lane == 0) { gstart[ng] = (short)base; grow[ng] = (short)((r0 + k) / GS); }
+                ++ng;
+            }
+            const int i = k + lane;
+            const bool nz = hs[i] != 0.0f;
+            const uint m = (uint)((simd_vote::vote_t)simd_ballot(nz));
+            const int prefix = popcount(m & ((1u << (uint)lane) - 1u));
+            if (nz) live[base + prefix] = (short)i;
+            base += popcount(m);
+        }
+        if (lane == 0) { gstart[ng] = (short)base; ngrp_tg = (short)ng; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int ngrp = ngrp_tg;
+
+    float out[8];                                       // this thread's 8 outputs
+    for (int n = 0; n < 8; ++n) out[n] = 0.0f;
+    for (int g = 0; g < ngrp; ++g) {
+        const int j0 = gstart[g], j1 = gstart[g + 1];
+        if (j0 == j1) continue;                         // whole 64-neuron group dead: no scales, no biases
+        float acc[8], hsum = 0.0f;
+        for (int n = 0; n < 8; ++n) acc[n] = 0.0f;
+        for (int j = j0; j < j1; j += UNR) {             // UNR live rows in flight per iteration
+            uint32_t q[UNR]; float hv[UNR];
+            for (int u = 0; u < UNR; ++u) {
+                const bool valid = j + u < j1;
+                const int i = valid ? (int)live[j + u] : (int)live[j];
+                q[u]  = wb[(size_t)i * NW + w];          // the live row's word: contiguous, one load
+                hv[u] = valid ? hs[i] : 0.0f;
+            }
+            for (int u = 0; u < UNR; ++u) {
+                hsum += hv[u];                           // for the biases: b * sum(h) over the group
+                for (int n = 0; n < 8; ++n) acc[n] += hv[u] * float((q[u] >> (4 * n)) & 0xFu);
+            }
+        }
+        if (LOADSC) {                                   // the group's affine terms, 8 outputs each
+            const device ST* sg = sb + (size_t)grow[g] * D;
+            const device ST* bg = bb + (size_t)grow[g] * D;
+            for (int n = 0; n < 8; ++n) out[n] += float(sg[n]) * acc[n] + float(bg[n]) * hsum;
+        } else {                                        // benchmarks only: isolate the nibble traffic
+            for (int n = 0; n < 8; ++n) out[n] += acc[n] + hsum;
+        }
+    }
+    device float* outp = part + ((size_t)bi * NS + s) * D + 8 * w;
+    for (int n = 0; n < 8; ++n) outp[n] = gain * out[n];
+"""
+
+REDUCE_SRC = """
+    const int o = (int)thread_position_in_grid.x, bi = (int)thread_position_in_grid.y;
+    if (o >= D) return;
+    const device float* p = part + (size_t)bi * NS * D + o;
+    float t = 0.0f;
+    for (int s = 0; s < NS; ++s) t += p[(size_t)s * D];
+    y[(size_t)bi * D + o] = T(t);
+"""
+
+_k_part = mx.fast.metal_kernel(
+    name="nsd_sparse_down_decode",
+    input_names=["h", "sel", "gains", "pw", "ps", "pb", "spw", "sps", "spb"],
+    output_names=["part"],
+    source=KERNEL_SRC,
+    header=HEADER,
+    ensure_row_contiguous=True,
+)
+_k_reduce = mx.fast.metal_kernel(
+    name="nsd_sparse_down_decode_reduce",
+    input_names=["part"],
+    output_names=["y"],
+    source=REDUCE_SRC,
+    header=HEADER,
+    ensure_row_contiguous=True,
+)
+
+
+def sparse_down(h, sel, gains, pw, ps, pb, spw, sps, spb, *, F, FS, D, topk,
+                sl=928, unr=2, nds=3, out_dtype=None, loadsc=1):
+    """Down projection over the live rows only.
+
+    h [B, topk*F + FS] (bf16/f16/f32), sel [B, topk] int32 (the routed experts),
+    gains [B, topk+1] f32 (routing scores, then 1 for the shared expert) -> y [B, D].
+
+    sl: neurons per slice (a multiple of 32 that tiles F and FS; 928 measured best).
+    unr: live rows in flight per loop iteration. nds: how many chunks the D outputs
+    are split into (threadgroups per slice).
+    """
+    B = h.shape[0]
+    NS = topk * (F // sl) + FS // sl
+    tmpl = [("T", h.dtype), ("ST", ps.dtype), ("D", D), ("F", F), ("FS", FS),
+            ("TOPK", topk), ("SL", sl), ("UNR", unr), ("NDS", nds), ("LOADSC", 1 if loadsc else 0)]
+    part, = _k_part(inputs=[h, sel, gains, pw, ps, pb, spw, sps, spb], template=tmpl,
+                    grid=(D // 8, NS, B), threadgroup=(D // 8 // nds, 1, 1),
+                    output_shapes=[(B, NS, D)], output_dtypes=[mx.float32])
+    od = out_dtype or h.dtype
+    y, = _k_reduce(inputs=[part], template=[("T", od), ("D", D), ("NS", NS)],
+                   grid=(D, B, 1), threadgroup=(min(D, 256), 1, 1),
+                   output_shapes=[(B, D)], output_dtypes=[od])
+    return y
+
+# ---- nsd/layout.py
+"""The neuron-major permutation of the checkpoint's quantised down projections.
+
+mlx-lm stores a quantised down projection as W[out=D, in=F]:
+
+    words    [.., D, F/8]  uint32   8 nibbles of one output row per word, low nibble first
+    scales   [.., D, F/64] bf16     groups along the reduction axis
+    biases   [.., D, F/64] bf16
+
+In that layout a neuron (an input column of W) whose activation is exactly zero
+still occupies half a byte in every one of the D rows, so a dead neuron cannot be
+skipped without first gathering its bytes from D far-apart words.
+
+Stored the other way round -- reduction-major, or neuron-major as this repository
+calls it --
+
+    pw  [.., F, D/8]  uint32   row i = neuron i, word w packs W[8w .. 8w+7, i]
+    ps  [.., F/64, D] bf16
+    pb  [.., F/64, D] bf16
+
+one neuron's weights are one contiguous D/2-byte row that is never read when the
+neuron is dead, and the 2 * D * 2 bytes of scales and biases of a 64-neuron group
+are read only when at least one neuron of the group is live. ReLU2, the expert
+activation of this model, leaves most neurons at exactly zero for any given
+token, which is what makes the layout worth having.
+
+The permutation is exact and self-inverse in its nibble part: no value is
+re-quantised, only moved, so the dequantised products are the ones MLX itself
+would form and a result differs from `mx.gather_qmm` only by fp32 summation order.
+"""
+
+import mlx.core as mx
+
+
+def nibble_transpose(w):
+    """[.., R, C/8] uint32 (8 nibbles of a row per word, low nibble first) -> [.., C, R/8]
+    uint32 with the same convention: out[.., c, wo] packs W[8*wo + n, c] for n = 0..7.
+
+    Exact and self-inverse. Pure MLX ops: every nibble is expanded to a uint32 on
+    the way (that is what the shifts and the sum do; the sum of nibbles shifted
+    into disjoint positions is their OR).
+    """
+    *lead, R, CW = w.shape
+    C = CW * 8
+    shifts = mx.array([4 * n for n in range(8)], dtype=mx.uint32)
+    nib = (w[..., None] >> shifts) & mx.array(0xF, dtype=mx.uint32)       # [.., R, CW, 8]
+    nib = nib.reshape(*lead, R, C)                                        # [.., R, C]  W[r, c]
+    nib = mx.swapaxes(nib, -1, -2)                                       # [.., C, R]
+    nib = nib.reshape(*lead, C, R // 8, 8)
+    out = (nib << shifts).sum(axis=-1).astype(mx.uint32)
+    return out
+
+
+def to_neuron_major(w, s, b, chunk=16):
+    """A down projection as mlx-lm stores it (w [.., D, F/8] u32, s / b [.., D, F/64])
+    -> (pw [.., F, D/8] u32, ps [.., F/64, D], pb [.., F/64, D]).
+
+    For the routed experts (a leading axis of 128) the nibble transpose is done
+    `chunk` experts at a time: each intermediate step expands every nibble to a
+    uint32, so the whole-expert-at-once transient would be ~4x the final size.
+    """
+    if w.ndim == 3 and w.shape[0] > chunk:
+        parts = []
+        for i in range(0, w.shape[0], chunk):
+            pw = mx.contiguous(nibble_transpose(w[i:i + chunk]))
+            mx.eval(pw)
+            parts.append(pw)
+        pw = mx.concatenate(parts, axis=0)
+        mx.eval(pw)
+        del parts
+    else:
+        pw = mx.contiguous(nibble_transpose(w))
+    ps = mx.contiguous(mx.swapaxes(s, -1, -2))
+    pb = mx.contiguous(mx.swapaxes(b, -1, -2))
+    return pw, ps, pb
+
+# ---- nsd/mamba.py
+"""Multi-row Mamba-2 steps with rollback, for speculative decoding.
+
+A Mamba-2 layer has no KV cache to trim: its state is a recurrent (conv state, ssm state)
+pair, and a verify step that processes B rows advances both by B. A rollback to the
+accepted prefix cannot restore them by slicing, so the verify step remembers its inputs
+-- the padded conv input and the ssm inputs of the B rows, and the state they started
+from -- and the rollback recomputes the state update over the first n_keep rows only.
+Attention layers, whose caches can be trimmed, are handled by the caller.
+
+This is the standard technique any speculative implementation needs for recurrent
+layers; `ssm_update` itself is mlx-lm's.
+"""
+import mlx.core as mx
+import mlx.nn as nn
+
+from mlx_lm.models.ssm import ssm_update
+
+
+def mamba_verify(block, x3, cache, records):
+    """One Mamba-2 block on x3 [1, L, D] with the cache advanced by L rows, remembering in
+    `records` what a later rollback to a shorter prefix needs. Same maths as the mixer's
+    own __call__, unrolled so the pieces are kept.
+    """
+    m = block.mixer
+    h = block.norm(x3)
+    proj = m.in_proj(h)
+    gate, conv_in, dt = mx.split(proj, [m.intermediate_size, m.intermediate_size + m.conv_dim], axis=-1)
+    nk = m.conv_kernel_size - 1
+    conv_state = cache[0] if cache[0] is not None else mx.zeros((1, nk, m.conv_dim), dtype=conv_in.dtype)
+    padded = mx.concatenate([conv_state, conv_in], axis=1)       # the conv window crossing the boundary
+    cache[0] = padded[:, -nk:]
+    co = nn.silu(m.conv1d(padded))
+    hs, Bm, Cm = mx.split(co, [m.intermediate_size, m.intermediate_size + m.n_groups * m.ssm_state_size], axis=-1)
+    L = x3.shape[1]
+    hs4 = hs.reshape(1, L, m.num_heads, m.head_dim)
+    B4 = Bm.reshape(1, L, m.n_groups, m.ssm_state_size)
+    C4 = Cm.reshape(1, L, m.n_groups, m.ssm_state_size)
+    state0 = cache[1]
+    y, st = ssm_update(hs4, m.A_log, B4, C4, m.D.astype(hs4.dtype), dt, m.dt_bias, state0,
+                       m.time_step_limit, None)
+    cache[1] = st
+    records.append((cache, padded, hs4, B4, C4, dt, state0, m))
+    y = m.norm(y.reshape(1, L, m.intermediate_size), gate)
+    return x3 + m.out_proj(y)
+
+
+def mamba_rollback(records, n_keep):
+    """After mamba_verify on L rows, put every cache in `records` back at the state after
+    the first n_keep rows: the conv window is a slice of the padded input, and the ssm
+    state is recomputed from the recorded inputs over the kept prefix only."""
+    for cache, padded, hs4, B4, C4, dt, state0, m in records:
+        nk = m.conv_kernel_size - 1
+        cache[0] = padded[:, n_keep:n_keep + nk]
+        _, st = ssm_update(hs4[:, :n_keep], m.A_log, B4[:, :n_keep], C4[:, :n_keep], m.D.astype(hs4.dtype),
+                           dt[:, :n_keep], m.dt_bias, state0, m.time_step_limit, None)
+        cache[1] = st
+
+# ---- nsd/model.py
+"""Nemotron 3.5 Lightning 30B A3B end to end on MLX, from the stock 4-bit checkpoint.
+
+The model itself is mlx-lm's own (`mlx_lm.load`), so dense mode is block-for-block what
+`mlx_lm.generate` runs and is the baseline in every comparison. What this module adds:
+
+  sparse   the MoE down projection runs over the live rows only, on a neuron-major
+           permutation of the checkpoint's own bytes built once at load (nsd.layout,
+           nsd.decode). The checkpoint's down layout is then freed, so exactly one layout
+           is resident and the model needs no more memory than dense mode. Prefill runs
+           on the same layout with the matrix-unit kernel (nsd.prefill), because the
+           permuted weights are transposed relative to what MLX's dense quantised GEMM
+           consumes and keeping both layouts would cost 8.4 GB.
+
+  mtp      greedy speculative decoding with NVIDIA's own MTP head (nsd.mtp): per step the
+           head drafts k tokens, the target verifies anchor + drafts in one step of k+1
+           rows, the attention KV caches are trimmed and the Mamba states recomputed to
+           the accepted prefix (nsd.mamba).
+
+Generation loops are pipelined: the next step is built and submitted before the current
+token is read back, and the wait is `y.item()`.
+"""
+import time
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+
+from mlx_lm import load as mlx_load
+from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
+
+from .decode import sparse_down
+from .layout import to_neuron_major
+from .mamba import mamba_rollback, mamba_verify
+from .prefill import build_tiles, build_union, sparse_down_prefill
+from .resolve import resolve_model
+
+MODES = ("dense", "sparse")
+
+# Measured defaults (see the benchmarks in bench/).
+DECODE_KW = dict(sl=928, unr=2, nds=3)        # decode kernel: slice, unroll, output chunks
+PREFILL_KW = dict(tt=32, nb=64, kc=32, nsg=4)  # prefill kernel: tile, block, K chunk, simdgroups
+# Layers whose per-tile union of live neurons is dense enough that a 64-slot tile beats a
+# 32-slot one: the B staging is paid once per tile and the union barely grows.
+PREFILL_TT64_LAYERS = (17, 20, 22, 24, 27, 29, 31, 51)
+
+
+def relu2(x):
+    return mx.square(nn.relu(x))
+
+
+class MoEBlock:
+    """One mlx-lm MoE block wired for the two down-projection modes.
+
+    dense:   the stock block, unchanged.
+    sparse:  the stock router and up projection, ReLU2, then the down projection over the
+             live rows on the neuron-major layout (decode) or over the per-tile union of
+             live neurons on the matrix units (prefill).
+    """
+
+    def __init__(self, block, args, decode_kw=DECODE_KW, prefill_kw=PREFILL_KW):
+        self.block = block
+        mix = block.mixer
+        self.topk = args.num_experts_per_tok
+        self.F = args.moe_intermediate_size
+        self.FS = args.moe_shared_expert_intermediate_size
+        self.D = args.hidden_size
+        self.E = args.n_routed_experts
+        self.group_size = mix.switch_mlp.fc1.group_size
+        self.bits = mix.switch_mlp.fc1.bits
+        self.decode_kw = dict(decode_kw)
+        self.prefill_kw = dict(prefill_kw)
+        self.has_layout = False      # the neuron-major layout has been built
+        self.stock_layout = True     # the checkpoint's own down layout is still resident
+        self.mode = "dense"
+
+    # ---- the neuron-major layout
+    @property
+    def w_routed(self):
+        """(pw, ps, pb): the routed experts' down projection, neuron-major."""
+        return (self.pw, self.ps, self.pb)
+
+    @property
+    def w_shared(self):
+        """(spw, sps, spb): the shared expert's down projection, neuron-major."""
+        return (self.spw, self.sps, self.spb)
+
+    def build_layout(self, drop_stock=True):
+        """Permute this block's down projections into the neuron-major layout (an exact
+        permutation of the checkpoint's bytes, nsd.layout); with drop_stock, free the
+        checkpoint's own layout so only one copy is resident."""
+        mix = self.block.mixer
+        fc2, shared = mix.switch_mlp.fc2, mix.shared_experts.down_proj
+        self.pw, self.ps, self.pb = to_neuron_major(fc2.weight, fc2.scales, fc2.biases)
+        self.spw, self.sps, self.spb = to_neuron_major(shared.weight, shared.scales, shared.biases)
+        mx.eval(self.pw, self.ps, self.pb, self.spw, self.sps, self.spb)
+        self.has_layout = True
+        if drop_stock:
+            self.drop_stock()
+
+    def drop_stock(self):
+        mix = self.block.mixer
+        for mod in (mix.switch_mlp.fc2, mix.shared_experts.down_proj):
+            for k in ("weight", "scales", "biases"):
+                mod[k] = mx.zeros((1,), dtype=mod[k].dtype)
+        self.stock_layout = False
+
+    # ---- shared front end: router, up projections, ReLU2
+    def front(self, x):
+        """x [B, D] -> (inds [B, topk], scores [B, topk], h [B, topk, 1, F], hs [B, FS]),
+        with h / hs after ReLU2."""
+        block, mix = self.block, self.block.mixer
+        xn = block.norm(x)
+        inds, scores = mix.gate(xn)
+        fc1 = mix.switch_mlp.fc1
+        u = mx.gather_qmm(xn[:, None, None, :], fc1.weight, fc1.scales, fc1.biases,
+                          rhs_indices=inds, transpose=True, group_size=self.group_size, bits=self.bits)
+        h = relu2(u)
+        hs = relu2(mix.shared_experts.up_proj(xn))
+        return inds, scores, h, hs
+
+    def pack(self, inds, scores, h, hs):
+        """The down kernel's inputs: h [B, topk*F + FS] (the routed experts then the shared
+        one, contiguous), the selected experts, and the gains (routing scores, 1 for shared)."""
+        B = h.shape[0]
+        hcat = mx.concatenate([h.reshape(B, self.topk * self.F), hs], axis=1)
+        gains = mx.concatenate([scores.astype(mx.float32), mx.ones((B, 1))], axis=1)
+        return hcat, inds.astype(mx.int32), gains
+
+    # ---- decode (x [B, D], B = 1 for plain steps, B = k+1 for a verify step)
+    def decode_dense(self, x):
+        return self.block(x[None])[0]
+
+    def decode_sparse(self, x):
+        hcat, sel, gains = self.pack(*self.front(x))
+        y = sparse_down(hcat, sel, gains, self.pw, self.ps, self.pb, self.spw, self.sps, self.spb,
+                        F=self.F, FS=self.FS, D=self.D, topk=self.topk, **self.decode_kw)
+        return x + y.astype(x.dtype)
+
+    def decode_fn(self, mode):
+        """The compiled decode function for this mode (mx.compile traces per row count, so
+        the multi-row verify step gets its own trace)."""
+        self.mode = mode
+        if mode == "dense":
+            return mx.compile(self.decode_dense)
+        assert self.has_layout, "sparse mode needs the neuron-major layout (build_layout)"
+        return mx.compile(self.decode_sparse)
+
+    # ---- prefill (x [T, D])
+    def prefill(self, x):
+        if self.mode == "sparse":
+            return self.prefill_sparse(x)
+        return self.block(x[None])[0]
+
+    def prefill_sparse(self, x):
+        """The stock sorted up projection, then the down projection over the per-tile union
+        of live neurons on the matrix-unit kernel. Tile order, union lists and gather all
+        on the GPU."""
+        block, mix = self.block, self.block.mixer
+        xn = block.norm(x)
+        inds, scores = mix.gate(xn)
+        xs, idx, inv = _gather_sort(xn[:, None, None, :], inds)
+        h = relu2(mix.switch_mlp.fc1(xs, idx, sorted_indices=True))
+        h = _scatter_unsort(h, inv, inds.shape).squeeze(-2)          # [T, topk, F], token order
+        hs = relu2(mix.shared_experts.up_proj(xn))
+        hcat, sel, gains = self.pack(inds, scores, h, hs)
+        kw = self.prefill_kw
+        tiles = build_tiles(sel, self.E, kw["tt"])
+        union = build_union(hcat, tiles[0], tiles[1], F=self.F, FS=self.FS, topk=self.topk,
+                            E=self.E, tt=kw["tt"], kc=kw["kc"])
+        y = sparse_down_prefill(hcat, sel, gains, self.pw, self.ps, self.pb, self.spw, self.sps, self.spb,
+                                F=self.F, FS=self.FS, D=self.D, topk=self.topk, E=self.E,
+                                tiles=tiles, union=union, **kw)
+        return x + y.astype(x.dtype)
+
+
+class NemotronModel:
+    """The whole model: mlx-lm's own blocks with our MoE down-projection modes and our
+    generation loops on top of them."""
+
+    def __init__(self, model_path=None, mode="sparse", verbose=True, wire=True,
+                 single_layout=True, n_layers=None):
+        """model_path: a local directory or an HF repo id (nsd.resolve).
+        mode: 'dense' (stock blocks) or 'sparse' (the neuron-major down projection).
+        single_layout: in sparse mode, free the checkpoint's down layout layer by layer as
+            the neuron-major one is built, so only one layout is ever resident (prefill then
+            necessarily runs on the matrix-unit kernel). The model then needs no more
+            memory than dense mode. Set False to keep both (benchmarks that compare them).
+        n_layers: debug, load only the first N layers."""
+        self.path = resolve_model(model_path)
+        if wire:
+            try:
+                mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+            except Exception:
+                pass
+        t0 = time.time()
+        self.model, self.tokenizer = mlx_load(self.path, tokenizer_config={}, lazy=False)
+        self.args = self.model.args
+        chars = self.args.hybrid_override_pattern[:n_layers] if n_layers else self.args.hybrid_override_pattern
+        self.types = [{"M": "mamba", "*": "attention", "E": "moe"}[c] for c in chars]
+        self.D = self.args.hidden_size
+        self.eps = self.args.layer_norm_epsilon
+        bb = self.model.backbone
+        self.embeddings, self.norm_f, self.lm_head = bb.embeddings, bb.norm_f, self.model.lm_head
+        self.layers = bb.layers[: len(self.types)]
+        self.single_layout = single_layout
+        self.blocks = []
+        for i, t in enumerate(self.types):
+            if t == "moe":
+                kw = dict(PREFILL_KW, tt=64 if i in PREFILL_TT64_LAYERS else PREFILL_KW["tt"])
+                self.blocks.append(MoEBlock(self.layers[i], self.args, prefill_kw=kw))
+            else:
+                self.blocks.append(self.layers[i])
+        self.moe_layers = [l for l, t in enumerate(self.types) if t == "moe"]
+        if verbose:
+            print(f"loaded {len(self.types)} layers  ({mx.get_active_memory() / 1e9:.1f} GB active, {time.time() - t0:.0f}s)", flush=True)
+        self.mode = None
+        self.set_mode(mode)
+        self.load_seconds = time.time() - t0
+
+    # ---- pieces shared with the MTP head
+    def embed(self, ids):
+        return self.embeddings(ids)
+
+    def head_fn(self, h):
+        return self.lm_head(h)
+
+    def logits(self, x):
+        return self.lm_head(self.norm_f(x))
+
+    # ---- modes
+    def set_mode(self, mode):
+        assert mode in MODES, mode
+        if mode == "sparse":
+            t0 = time.time()
+            for l in self.moe_layers:
+                blk = self.blocks[l]
+                if not blk.has_layout:
+                    # one layer at a time: the transient of the permutation stays bounded
+                    # and the freed bytes are reusable for the next layer
+                    blk.build_layout(drop_stock=self.single_layout)
+                    mx.clear_cache()
+            if time.time() - t0 > 0.5:
+                print(f"neuron-major down layouts built in {time.time() - t0:.1f}s "
+                      f"({mx.get_active_memory() / 1e9:.1f} GB active)", flush=True)
+        else:
+            for l in self.moe_layers:
+                assert self.blocks[l].stock_layout, "dense mode needs the checkpoint's down layout, freed by sparse mode"
+        self.moe_fn = {l: self.blocks[l].decode_fn(mode) for l in self.moe_layers}
+        self.mode = mode
+        mx.clear_cache()
+
+    def make_cache(self):
+        return [ArraysCache(size=2) if t == "mamba" else KVCache() if t == "attention" else None
+                for t in self.types]
+
+    # ---- forward
+    def prefill(self, tokens, cache, chunk=2048, on_hidden=None):
+        """tokens [T] -> the residual stream of the last position [1, D].
+        on_hidden(start, x [t, D]) is called per chunk with the chunk's residual stream
+        BEFORE norm_f (the MTP head's prefill hook)."""
+        T = tokens.shape[0]
+        last = None
+        for i in range(0, T, chunk):
+            x = self.embed(tokens[i:i + chunk])
+            for l, bt in enumerate(self.types):
+                blk, c = self.blocks[l], cache[l]
+                if bt == "moe":
+                    x = blk.prefill(x)
+                else:
+                    x3 = x[None]
+                    mask = create_attention_mask(x3, c) if bt == "attention" else None
+                    x = blk(x3, mask=mask, cache=c)[0]
+            if on_hidden is not None:
+                on_hidden(i, x)
+            last = x[-1:]
+            mx.eval(last, *[s for c in cache if c is not None for s in c.state])
+        return last
+
+    def step(self, x):
+        """One decode step on x [1, D], through every block, with self._cache."""
+        for l, bt in enumerate(self.types):
+            if bt == "moe":
+                x = self.moe_fn[l](x)
+            else:
+                x = self.blocks[l](x[:, None, :], mask=None, cache=self._cache[l])[:, 0]
+        return x
+
+    # ---- plain generation
+    def generate(self, prompt, max_tokens=128, temp=0.0, eos=(), chunk=2048, cache=None):
+        """Yields (token, stats) per token; stats is None except on the last yield.
+        Greedy (temp=0) or sampled. The step after the current token is built and
+        submitted before the current token is read back; the wait is `y.item()` -- an
+        `int(y[0])` would enqueue an op behind the submitted step and destroy the overlap."""
+        prompt = mx.array(prompt, dtype=mx.int32)
+        self._cache = cache or self.make_cache()
+        t0 = time.perf_counter()
+        h = self.prefill(prompt, self._cache, chunk)
+
+        def sample(h):
+            lg = self.logits(h).astype(mx.float32)
+            return mx.argmax(lg, axis=-1) if temp == 0 else mx.random.categorical(lg / temp)
+
+        y = sample(h)
+        mx.eval(y)
+        prompt_s = time.perf_counter() - t0
+        tok = int(y.item())
+        out = [tok]
+        t1 = time.perf_counter()
+        n = 1
+        y_next = sample(self.step(self.embed(y).reshape(1, self.D)))
+        mx.async_eval(y_next)
+        while n < max_tokens and tok not in eos:
+            yield tok, None
+            y_after = sample(self.step(self.embed(y_next).reshape(1, self.D)))
+            mx.async_eval(y_after)
+            tok = int(y_next.item())
+            out.append(tok)
+            n += 1
+            y_next = y_after
+        dec_s = time.perf_counter() - t1
+        yield tok, self._stats(prompt, prompt_s, n, dec_s, out, temp=temp)
+
+    def _stats(self, prompt, prompt_s, n, dec_s, out, **extra):
+        return dict(mode=self.mode, prompt_tokens=int(prompt.shape[0]), prompt_s=prompt_s,
+                    prompt_tps=prompt.shape[0] / prompt_s, gen_tokens=n, decode_s=dec_s,
+                    decode_tps=(n - 1) / dec_s if n > 1 else float("nan"),
+                    ms_per_token=1e3 * dec_s / max(n - 1, 1),
+                    peak_gb=mx.get_peak_memory() / 1e9, tokens=out, **extra)
+
+    # ---- the verify step and the rollback shared by speculative decoding
+    def verify_step(self, x, cache):
+        """x [B, D]: B consecutive positions through every layer in ONE step, every cache
+        advanced by B rows. Returns the final residual stream [B, D]. Remembers what
+        rollback() needs (the Mamba recurrence inputs of these rows)."""
+        self._records = []
+        for l, bt in enumerate(self.types):
+            if bt == "moe":
+                x = self.moe_fn[l](x)
+            elif bt == "attention":
+                x3 = x[None]
+                x = self.blocks[l](x3, mask=create_attention_mask(x3, cache[l]), cache=cache[l])[0]
+            else:
+                x = mamba_verify(self.blocks[l], x[None], cache[l], self._records)[0]
+        return x
+
+    def rollback(self, cache, n_keep, B):
+        """Undo a verify_step of B rows beyond its first n_keep: attention caches are
+        trimmed, Mamba states recomputed from the recorded inputs over the kept prefix."""
+        if n_keep == B:
+            return
+        for l, bt in enumerate(self.types):
+            if bt == "attention":
+                cache[l].trim(B - n_keep)
+        mamba_rollback(self._records, n_keep)
+
+    @staticmethod
+    def _spec_stats(n_draft, steps, accepted, dec_s, n):
+        return dict(n_draft=n_draft, steps=steps, ms_per_step=1e3 * dec_s / max(steps, 1),
+                    tokens_per_step=(n - 1) / max(steps, 1),
+                    accepted_mean=float(np.mean(accepted)) if accepted else 0.0,
+                    accepted_hist=[int(sum(1 for v in accepted if v == k)) for k in range(n_draft + 1)])
+
+    # ---- MTP speculative decoding
+    def generate_mtp(self, prompt, mtp, n_draft=2, max_tokens=128, eos=(), chunk=2048):
+        """Greedy speculative decoding with the MTP head. Yields (token, stats); stats is
+        None except on the last yield.
+
+        Per step: the head first runs over the rows the previous verify confirmed (target
+        hidden at position p, token at p+1 -> its prediction of the token at p+2); the last
+        row's prediction is the draft, and with n_draft > 1 the head is chained on its own
+        hidden output for the further drafts. Those chained rows leave the head's cache
+        again after the verify (it only ever holds confirmed rows). The target verifies
+        [anchor, drafts] in one step of n_draft+1 rows; with greedy sampling the accepted
+        prefix is the longest run of drafts equal to the target's own argmax, and the
+        target's argmax at the first mismatch is the bonus token. Greedy only."""
+        assert n_draft >= 1
+        prompt = mx.array(prompt, dtype=mx.int32)
+        cache = self.make_cache()
+        mtp.reset()
+        hidden = (lambda x: x) if mtp.prenorm else self.norm_f
+        last_h = []
+
+        def on_hidden(i, x):                       # the head's prefill: rows (h_p, tok_{p+1}), p < T-1
+            hp = hidden(x)
+            nxt = prompt[i + 1: i + 1 + x.shape[0]]
+            if nxt.shape[0] > 0:
+                mtp(hp[: nxt.shape[0]], nxt)
+            mx.eval(*mtp.kv.state)                 # do not hold the whole prefill graph
+            last_h.append(hp[-1:])
+
+        t0 = time.perf_counter()
+        x_last = self.prefill(prompt, cache, chunk, on_hidden=on_hidden)
+        y = mx.argmax(self.logits(x_last).astype(mx.float32), axis=-1)
+        mx.eval(y)
+        prompt_s = time.perf_counter() - t0
+        tok = int(y.item())
+        out = [tok]
+        pend_h, pend_t = [last_h[-1]], [tok]       # rows the head has not seen yet: (hidden at p, token at p+1)
+        pending = tok
+        t1 = time.perf_counter()
+        n = 1
+        steps = 0
+        acc = []
+        bs = n_draft + 1
+        while n < max_tokens and tok not in eos:
+            d, hd = mtp(mx.concatenate(pend_h, axis=0), mx.array(pend_t, dtype=mx.int32))
+            drafts = [d[-1:]]
+            hd = hd[-1:]
+            for _ in range(1, n_draft):            # chain the head on its own hidden output
+                d, hd = mtp(hd, drafts[-1])
+                drafts.append(d)
+            draft = mx.concatenate(drafts) if n_draft > 1 else drafts[0]
+            mx.async_eval(draft)
+            ids = mx.concatenate([mx.array([tok], dtype=mx.int32), draft])
+            x = self.verify_step(self.embed(ids), cache)
+            hv = hidden(x)
+            tgt = mx.argmax(self.head_fn(hv if not mtp.prenorm else self.norm_f(x)).astype(mx.float32), axis=-1)
+            mx.async_eval(tgt, hv)
+            dl = draft.tolist()
+            tl = tgt.tolist()
+            a = next((i for i in range(bs - 1) if dl[i] != tl[i]), bs - 1)
+            new = (dl[:a] + [tl[a]])[: max_tokens - n]
+            self.rollback(cache, a + 1, bs)
+            if n_draft > 1:
+                mtp.trim(n_draft - 1)              # drop the chained speculative rows
+            pend_h = [hv[i:i + 1] for i in range(len(new))]
+            pend_t = list(new)
+            steps += 1
+            acc.append(a)
+            for tk in new:
+                yield pending, None
+                pending = tk
+                out.append(tk)
+                n += 1
+                tok = tk
+                if tk in eos:
+                    break
+        dec_s = time.perf_counter() - t1
+        yield pending, self._stats(prompt, prompt_s, n, dec_s, out, temp=0.0,
+                                   spec=dict(kind="mtp", prenorm=mtp.prenorm,
+                                             **self._spec_stats(n_draft, steps, acc, dec_s, n)))
+
+# ---- nsd/mtp.py
+"""NVIDIA's multi-token-prediction head for Nemotron 3.5 Lightning, as a drafter.
+
+The model's own release ships an MTP head (its `mtp.layers.0/1` tensors): enorm, hnorm,
+eh_proj, one attention block, one MoE block and a final layernorm. It predicts the token
+two positions ahead from the target's hidden state at position p and the embedding of the
+token at p+1:
+
+    x = eh_proj(concat(enorm(embed(tok_{p+1})), hnorm(h_p))) -> attention -> MoE -> norm
+    logits = lm_head(x)        predicts tok_{p+2}
+
+The embedding table and lm_head are the target model's. The attention block carries a KV
+cache over the rows the target has confirmed; positions are the target's.
+
+mlx-community's 4-bit export of the model drops the `mtp.*` tensors, so the head is
+published separately, quantised to the same affine 4-bit / group 64 format
+(`sevren-ai/nemotron-3.5-lightning-mtp-head-mlx-4bit`, file `mtp_head.safetensors`, 772 MB),
+and this class loads that file. The head is NVIDIA's; speculative decoding with a
+verify-and-rollback step is the standard technique (Leviathan et al., Chen et al.); what
+this repository adds is the MLX plumbing for this model.
+
+`h_p` is fed BEFORE the target's final layernorm (prenorm=True, the default): that is the
+state the head was trained on (Megatron's decoder output) and it drafts noticeably better
+than the post-norm state. prenorm=False feeds the state after norm_f instead.
+"""
+import json
+import os
+
+import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_flatten
+
+from mlx_lm.models import nemotron_h as nh
+from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.cache import KVCache
+
+from .resolve import resolve_head
+
+HEAD_FILE = "mtp_head.safetensors"
+
+
+class MTPHead:
+    """The standalone 4-bit MTP head, wired to a loaded target model."""
+
+    def __init__(self, target, head_dir=None, prenorm=True):
+        """target: a nsd.model.NemotronModel (its embedding and lm_head are shared).
+        head_dir: the head's directory; resolved from the default locations when None."""
+        head_dir = resolve_head(head_dir)
+        args = target.args
+        self.target, self.eps, self.prenorm = target, args.layer_norm_epsilon, prenorm
+        self.attn = nh.NemotronHBlock(args, "*")
+        self.moe = nh.NemotronHBlock(args, "E")
+        w = mx.load(os.path.join(head_dir, HEAD_FILE))
+        meta = json.load(open(os.path.join(head_dir, "config.json")))
+        q = meta["quantization"]
+        nn.quantize(self.attn, group_size=q["group_size"], bits=q["bits"])
+        nn.quantize(self.moe, group_size=q["group_size"], bits=q["bits"])
+        self.attn.load_weights([(k[len("attn."):], v) for k, v in w.items() if k.startswith("attn.")], strict=True)
+        self.moe.load_weights([(k[len("moe."):], v) for k, v in w.items() if k.startswith("moe.")], strict=True)
+        self.enorm, self.hnorm = w["enorm"], w["hnorm"]
+        self.eh_proj, self.final_norm = w["eh_proj"], w["final_norm"]
+        mx.eval(self.enorm, self.hnorm, self.eh_proj, self.final_norm, self.attn.parameters(), self.moe.parameters())
+        del w
+        self.bytes = sum(a.nbytes for a in (self.enorm, self.hnorm, self.eh_proj, self.final_norm)) + \
+            sum(a.nbytes for m in (self.attn, self.moe) for _, a in tree_flatten(m.parameters()))
+        self.reset()
+
+    def reset(self):
+        self.kv = KVCache()
+
+    def trim(self, n):
+        """Drop the last n rows of the head's cache (the speculative rows after a verify)."""
+        self.kv.trim(n)
+
+    def __call__(self, h, toks):
+        """h [R, D]: the target's hidden state at R confirmed positions (see prenorm);
+        toks [R] int32: the token that FOLLOWS each row's position (tok_{p+1} for row p)
+        -> (pred [R] int32 = the argmax, i.e. the token two positions ahead of each row,
+             hn [R, D] = the head's own normed hidden state, for chaining).
+        """
+        R = h.shape[0]
+        e = mx.fast.rms_norm(self.target.embed(toks), self.enorm, self.eps)
+        hh = mx.fast.rms_norm(h, self.hnorm, self.eps)
+        x = (mx.concatenate([e, hh], axis=-1) @ self.eh_proj.T)[None]
+        x = self.attn(x, mask=create_attention_mask(x, self.kv) if R > 1 else None, cache=self.kv)
+        x = self.moe(x)
+        hn = mx.fast.rms_norm(x[0], self.final_norm, self.eps)
+        logits = self.target.head_fn(hn).astype(mx.float32)
+        return mx.argmax(logits, axis=-1).astype(mx.int32), hn
+
+# ---- nsd/prefill.py
+"""Sparse MoE down projection for prefill, on the matrix units, on the SAME neuron-major
+layout the decode kernel uses (nsd.layout / nsd.decode).
+
+The decode kernel is one threadgroup per (token, slice): each live weight row is loaded
+once per token, which is the right trade at batch 1 but loses to a dense GEMM at prefill
+lengths, where MLX's dense quantised GEMM runs on the GPU matrix units. But the neuron-major
+layout is transposed relative to what that dense GEMM consumes, so without this kernel the
+model would either have to keep both layouts resident (+8.4 GB) or transpose the weights for
+every prompt.
+
+So prefill runs its own GEMM on the matrix units and spends the sparsity the other way round:
+the (token, expert-slot) pairs are sorted by expert and cut into tiles of TT slots; per tile
+the UNION of the neurons live in any of its slots is the reduction dimension of a small
+dense GEMM, h[TT x U] @ W[U x D], computed with Metal's mpp::tensor_ops::matmul2d over
+K-chunks of KC rows. Rows dead for the whole tile are never read or multiplied; the FLOPs
+are the union fraction of the dense GEMM.
+
+Three small kernels around the GEMM, all on the GPU (no host round trip in the middle of a
+prefill step):
+
+    build_tiles   the tile order as MLX ops with a FIXED tile count, so nothing has to be
+                  read back; tiles the routing does not fill carry expert -1 and are skipped
+    _k_union      per tile, the union of live neurons, compacted with ballots and a scan
+    _k_gather     each slot's h at its tile's union rows, as half, the A tile of the GEMM
+
+The B tile is staged per K-chunk: a live row's 8 nibbles dequantised with its 64-group's
+bf16 scale and bias (one uint4 each, contiguous in the neuron-major layout) into half.
+The loads of chunk k+1 are issued into registers before the matrix-unit call for chunk k
+(software pipeline); a barrier before restaging makes that safe, because the cooperative
+matmul has every simdgroup still reading the previous tiles when an individual thread
+returns from it.
+
+The epilogue writes one row per (token, partial) with the routing gain applied, token-major,
+so the reduction over a token's topk+1 partials is a contiguous sum.
+"""
+
+import mlx.core as mx
+
+NA_HEADER = """
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+"""
+
+UNION_SRC = """
+    // h [T, NR] (T), tile_e [NT] int32 (>= E: shared expert, -1: empty tile),
+    // tile_slot [NT*TT] int32 (-1 pad) -> ulist [NT*UMAX] int32 (-1 pad, ascending), ucount [NT] int32.
+    // One threadgroup per tile: each thread owns columns c = tid, tid+NTH, ..., ORs the tile's
+    // TT slots at c, then a ballot plus a prefix scan compacts the live columns.
+    constexpr int NR = TOPK * F + FS;
+    const int tid = (int)thread_position_in_threadgroup.x, tile = (int)threadgroup_position_in_grid.y;
+    const int lane = (int)thread_index_in_simdgroup, sgi = (int)simdgroup_index_in_threadgroup;
+    constexpr int NSGU = NTH / 32;
+    const int e = tile_e[tile];
+    if (e < 0) {                                        // empty tile of the fixed-size order
+        for (int i = tid; i < UMAX; i += NTH) ulist[(size_t)tile * UMAX + i] = -1;
+        if (tid == 0) ucount[tile] = 0;
+        return;
+    }
+    const bool shared = e >= E;
+    const int FF = shared ? FS : F;
+    threadgroup int hoff[TT];                           // row offset of slot m's h into h[], -1 pad
+    threadgroup int sgsum[NSGU];
+    threadgroup int base;
+    if (tid < TT) {
+        const int s = tile_slot[tile * TT + tid];
+        hoff[tid] = (s < 0) ? -1 : (shared ? s * NR + TOPK * F : (s / TOPK) * NR + (s % TOPK) * F);
+    }
+    if (tid == 0) base = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device int* out = ulist + (size_t)tile * UMAX;
+    for (int c0 = 0; c0 < UMAX; c0 += NTH) {
+        const int c = c0 + tid;
+        bool live = false;
+        if (c < FF) for (int m = 0; m < TT; ++m) live = live || (hoff[m] >= 0 && h[hoff[m] + c] != T(0));
+        const int v = live ? 1 : 0;
+        const int ex = simd_prefix_exclusive_sum(v);
+        const int tot = simd_sum(v);
+        if (lane == 0) sgsum[sgi] = tot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int before = 0;
+        for (int i = 0; i < sgi; ++i) before += sgsum[i];
+        if (live) out[base + before + ex] = c;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) { int t = 0; for (int i = 0; i < NSGU; ++i) t += sgsum[i]; base += t; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = base + tid; i < UMAX; i += NTH) out[i] = -1;
+    if (tid == 0) ucount[tile] = base;
+"""
+
+GATHER_SRC = """
+    // h [T, NR] (T), tile_e [NT], tile_slot [NT*TT], ulist [NT*UMAX], ucount [NT]
+    //   -> hc [NT*TT, UMAX] half: slot (tile, m)'s h at its tile's union rows.
+    // One thread over 8 union rows of one slot; rows beyond the tile's live union are left
+    // untouched (the GEMM never reads them).
+    constexpr int NR = TOPK * F + FS;
+    const int g = (int)thread_position_in_grid.x;           // over NT*TT*(UMAX/8)
+    constexpr int G8 = UMAX / 8;
+    const int u8 = (g % G8) * 8, row = g / G8;              // row = tile*TT + m
+    if (row >= NT * TT) return;
+    const int tile = row / TT, m = row % TT;
+    if (u8 >= ((ucount[tile] + 7) / 8) * 8) return;
+    const int s = tile_slot[row], e = tile_e[tile];
+    const bool shared = e >= E;
+    const int hoff = (s < 0) ? -1 : (shared ? s * NR + TOPK * F : (s / TOPK) * NR + (s % TOPK) * F);
+    half v[8];
+    for (int j = 0; j < 8; ++j) {
+        const int r = ulist[(size_t)tile * UMAX + u8 + j];
+        v[j] = (hoff >= 0 && r >= 0) ? (half)h[hoff + r] : half(0);
+    }
+    device half* dst = hc + (size_t)row * UMAX + u8;
+    for (int j = 0; j < 8; ++j) dst[j] = v[j];
+"""
+
+GEMM_SRC = """
+    // hc [NT*TT, UMAX] half, tile_e [NT] int32 (>= E: shared, -1: empty), tile_slot [NT*TT] int32 (-1 pad),
+    // ulist [NT*UMAX] int32 (union rows, -1 pad, ascending), ucount [NT] int32, gains [T, TOPK+1] f32,
+    // pw [E, F, D/8] u32, ps / pb [E, F/64, D] (ST, neuron-major), spw [FS, D/8] u32, sps / spb [FS/64, D]
+    //   -> part [T*(TOPK+1), D] PT
+    constexpr int GS  = 64;
+    constexpr int NW  = D / 8;
+    constexpr int WPB = NB / 8;                            // weight words per row inside this column block
+    static_assert(D % NB == 0 && NB % 8 == 0 && TT % 8 == 0 && KC % 8 == 0 && UMAX % 8 == 0, "");
+    const int tid  = (int)thread_position_in_threadgroup.x;
+    // grid: y = column block, z = tile, so a tile's D/NB blocks are adjacent threadgroups and
+    // share its staged h and weight rows through the cache
+    const int tile = (int)threadgroup_position_in_grid.z;
+    const int n0   = (int)threadgroup_position_in_grid.y * NB;
+    const int e = tile_e[tile];
+    if (e < 0) return;                                     // empty tile of the fixed-size order
+    const bool shared = e >= E;
+    const device uint32_t* wb = shared ? spw : pw + (size_t)max(e, 0) * F * NW;
+    const device ST* sb = shared ? sps : ps + (size_t)e * (F / GS) * D;
+    const device ST* bb = shared ? spb : pb + (size_t)e * (F / GS) * D;
+    threadgroup half As[TT * KC];                          // A tile: the slots' h at the chunk's union rows
+    threadgroup half Bs[KC * NB];                           // B tile: the rows' dequantised weights
+    threadgroup int  rows[KC];                              // the chunk's union rows (-1 pad)
+    constexpr auto desc = matmul2d_descriptor(TT, NB, KC, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(As, dextents<int32_t, 2>(KC, TT));
+    auto tB = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(Bs, dextents<int32_t, 2>(NB, KC));
+    auto cT = op.template get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] = 0.0f;
+    const int U = ucount[tile];
+    const device int* ul = ulist + (size_t)tile * UMAX;
+    // Software pipeline: the loads of chunk k+1 are issued into registers BEFORE the matrix-unit
+    // call for chunk k, so their latency overlaps the multiply. Each thread owns WPT weight
+    // words and its share of the A rows per chunk.
+    constexpr int WPT = (KC * WPB + NTH - 1) / NTH;
+    uint  qreg[WPT]; uint4 sreg[WPT]; uint4 breg[WPT];
+    uint4 areg[(TT * (KC / 8) + NTH - 1) / NTH];
+    auto bf = [](uint bits) -> half { return half(as_type<float>(bits << 16)); };   // bf16 bits -> half
+    auto load_chunk = [&](int u0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < KC) rows[tid] = (u0 + tid < U) ? ul[u0 + tid] : -1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (int t = 0; t < WPT; ++t) {
+            const int w = tid + t * NTH;
+            qreg[t] = 0u; sreg[t] = uint4(0u); breg[t] = uint4(0u);
+            if (w < KC * WPB) {
+                const int k = w / WPB, c8 = (w % WPB) * 8, r = rows[k];
+                if (r >= 0) {
+                    qreg[t] = wb[(size_t)r * NW + (n0 + c8) / 8];                // 8 outputs of live row r
+                    sreg[t] = *(const device uint4*)(sb + (size_t)(r / GS) * D + n0 + c8);   // its group's 8 scales
+                    breg[t] = *(const device uint4*)(bb + (size_t)(r / GS) * D + n0 + c8);
+                }
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < (TT * (KC / 8) + NTH - 1) / NTH; ++t) {
+            const int i = tid + t * NTH;
+            if (i < TT * (KC / 8)) { const int m = i / (KC / 8), k8 = (i % (KC / 8)) * 8; areg[t] = *(const device uint4*)(hc + (size_t)(tile * TT + m) * UMAX + u0 + k8); }
+        }
+    };
+    if (U > 0) load_chunk(0);
+    for (int u0 = 0; u0 < U; u0 += KC) {
+        // Restaging overwrites As/Bs, which every simdgroup is still reading when an
+        // individual thread returns from the matmul: this barrier is what makes the
+        // software pipeline safe.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (int t = 0; t < (TT * (KC / 8) + NTH - 1) / NTH; ++t) {
+            const int i = tid + t * NTH;
+            if (i < TT * (KC / 8)) { const int m = i / (KC / 8), k8 = (i % (KC / 8)) * 8; *(threadgroup uint4*)(As + m * KC + k8) = areg[t]; }
+        }
+        #pragma unroll
+        for (int t = 0; t < WPT; ++t) {
+            const int w = tid + t * NTH;
+            if (w < KC * WPB) {
+                const int k = w / WPB, c8 = (w % WPB) * 8;
+                const uint q = qreg[t]; const uint4 s4 = sreg[t], b4 = breg[t];
+                const half4 q0 = half4(half(q & 0xFu), half((q >> 4) & 0xFu), half((q >> 8) & 0xFu), half((q >> 12) & 0xFu));
+                const half4 q1 = half4(half((q >> 16) & 0xFu), half((q >> 20) & 0xFu), half((q >> 24) & 0xFu), half(q >> 28));
+                const half4 s0 = half4(bf(s4.x & 0xFFFFu), bf(s4.x >> 16), bf(s4.y & 0xFFFFu), bf(s4.y >> 16));
+                const half4 s1 = half4(bf(s4.z & 0xFFFFu), bf(s4.z >> 16), bf(s4.w & 0xFFFFu), bf(s4.w >> 16));
+                const half4 b0 = half4(bf(b4.x & 0xFFFFu), bf(b4.x >> 16), bf(b4.y & 0xFFFFu), bf(b4.y >> 16));
+                const half4 b1 = half4(bf(b4.z & 0xFFFFu), bf(b4.z >> 16), bf(b4.w & 0xFFFFu), bf(b4.w >> 16));
+                *(threadgroup half4*)(Bs + k * NB + c8)     = q0 * s0 + b0;   // a dead row: q = s = b = 0 -> zeros
+                *(threadgroup half4*)(Bs + k * NB + c8 + 4) = q1 * s1 + b1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (u0 + KC < U) load_chunk(u0 + KC);               // next chunk's loads in flight during the multiply
+        op.run(tA, tB, cT);
+    }
+    // epilogue: routing gain per slot, token-major (row = token*(TOPK+1) + k, shared at k = TOPK),
+    // so the reduction over a token's TOPK+1 partials is a contiguous sum
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) {
+        const auto idx = cT.get_multidimensional_index(i);
+        const int n = idx[0], m = idx[1];
+        const int s = tile_slot[tile * TT + m];
+        if (s >= 0) {
+            const int gi = shared ? s * (TOPK + 1) + TOPK : (s / TOPK) * (TOPK + 1) + (s % TOPK);
+            part[(size_t)gi * D + n0 + n] = (PT)(cT[i] * gains[gi]);
+        }
+    }
+"""
+
+_k_union = mx.fast.metal_kernel(
+    name="nsd_prefill_union",
+    input_names=["h", "tile_e", "tile_slot"],
+    output_names=["ulist", "ucount"],
+    source=UNION_SRC,
+    header=NA_HEADER,
+)
+_k_gather = mx.fast.metal_kernel(
+    name="nsd_prefill_gather",
+    input_names=["h", "tile_e", "tile_slot", "ulist", "ucount"],
+    output_names=["hc"],
+    source=GATHER_SRC,
+    header=NA_HEADER,
+)
+_k_gemm = mx.fast.metal_kernel(
+    name="nsd_prefill_gemm",
+    input_names=["hc", "tile_e", "tile_slot", "ulist", "ucount", "gains", "pw", "ps", "pb", "spw", "sps", "spb"],
+    output_names=["part"],
+    source=GEMM_SRC,
+    header=NA_HEADER,
+)
+
+
+def build_tiles(sel, E, tt):
+    """The tile order: slots (token, expert-slot) sorted by expert, tiles of tt slots of one
+    expert, then the shared expert's tiles of tt tokens.
+
+    MLX ops only, with a FIXED tile count (an upper bound that never depends on the routing),
+    so nothing has to be read back to the host between the up projection and the down kernel;
+    tiles beyond what the routing fills carry expert -1 and every kernel skips them.
+
+    sel [T, topk] int32 -> (tile_e [NT] int32, tile_slot [NT*tt] int32) where a slot is
+    t*topk + k for a routed expert and t for the shared one, -1 padding.
+    """
+    T, K = sel.shape
+    flat = sel.reshape(-1).astype(mx.int32)
+    order = mx.argsort(flat).astype(mx.int32)
+    counts = mx.zeros((E,), dtype=mx.int32).at[flat].add(1)
+    ntile = (counts + tt - 1) // tt
+    tile_base = mx.cumsum(ntile) - ntile
+    exp_start = mx.cumsum(counts) - counts
+    total = ntile.sum()
+    NT_routed = T * K // tt + E                          # upper bound on the routed tile count
+    t = mx.arange(NT_routed, dtype=mx.int32)
+    e_of_t = (tile_base[None, :] <= t[:, None]).sum(axis=1).astype(mx.int32) - 1
+    tile_e_routed = mx.where(t < total, e_of_t, -1)
+    j = mx.arange(T * K, dtype=mx.int32)
+    e_j = flat[order]
+    rank = j - exp_start[e_j]                              # the slot's index within its expert
+    dst = (tile_base[e_j] + rank // tt) * tt + rank % tt
+    tile_slot_routed = mx.full((NT_routed * tt,), -1, dtype=mx.int32).at[dst].add(order + 1)
+    NT_shared = (T + tt - 1) // tt
+    tile_e_shared = mx.full((NT_shared,), E, dtype=mx.int32)
+    tile_slot_shared = mx.where(mx.arange(NT_shared * tt) < T, mx.arange(NT_shared * tt), -1).astype(mx.int32)
+    return mx.concatenate([tile_e_routed, tile_e_shared]), mx.concatenate([tile_slot_routed, tile_slot_shared])
+
+
+def build_union(h, tile_e, tile_slot, *, F, FS, topk, E, tt, kc=32, nth=256):
+    """The union of live neurons per tile, one compaction kernel. UMAX is FS padded up to a
+    multiple of kc for every tile (routed tiles are padded with dead columns)."""
+    NT = tile_e.shape[0]
+    UMAX = (FS + kc - 1) // kc * kc
+    tmpl = [("T", h.dtype), ("F", F), ("FS", FS), ("TOPK", topk), ("E", E), ("TT", tt),
+            ("UMAX", UMAX), ("NTH", nth)]
+    ulist, ucount = _k_union(inputs=[h, tile_e, tile_slot], template=tmpl,
+                             grid=(nth, NT, 1), threadgroup=(nth, 1, 1),
+                             output_shapes=[(NT, UMAX), (NT,)], output_dtypes=[mx.int32, mx.int32])
+    return ulist, ucount
+
+
+def sparse_down_prefill(h, sel, gains, pw, ps, pb, spw, sps, spb, *, F, FS, D, topk, E,
+                        tt=32, nb=64, kc=32, nsg=4, tiles=None, union=None, out_dtype=None):
+    """The MoE down projection over a whole prompt chunk on the neuron-major layout.
+
+    h [T, topk*F + FS], sel [T, topk] int32, gains [T, topk+1] f32 -> y [T, D]. The tile
+    order and the union lists are built on the GPU when not given. tt: slots per tile;
+    nb: output columns per block; kc: union rows per matrix-unit chunk; nsg: simdgroups
+    per threadgroup. All measured defaults; the dense middle of the model prefers tt=64.
+    """
+    T = h.shape[0]
+    tile_e, tile_slot = tiles if tiles is not None else build_tiles(sel, E, tt)
+    ulist, ucount = union if union is not None else build_union(h, tile_e, tile_slot, F=F, FS=FS, topk=topk, E=E, tt=tt, kc=kc)
+    NT = tile_e.shape[0]
+    UMAX = ulist.shape[1]
+    nth = 32 * nsg
+    gt = [("T", h.dtype), ("F", F), ("FS", FS), ("TOPK", topk), ("E", E), ("TT", tt),
+          ("UMAX", UMAX), ("NT", NT)]
+    ng = NT * tt * (UMAX // 8)
+    hc, = _k_gather(inputs=[h, tile_e, tile_slot, ulist.reshape(-1), ucount], template=gt,
+                    grid=((ng + 255) // 256 * 256, 1, 1), threadgroup=(256, 1, 1),
+                    output_shapes=[(NT * tt, UMAX)], output_dtypes=[mx.float16])
+    tmpl = [("ST", ps.dtype), ("PT", mx.float32), ("D", D), ("F", F), ("FS", FS), ("TOPK", topk),
+            ("E", E), ("TT", tt), ("NB", nb), ("KC", kc), ("UMAX", UMAX), ("NSG", nsg), ("NTH", nth)]
+    part, = _k_gemm(inputs=[hc, tile_e, tile_slot, ulist.reshape(-1), ucount, gains, pw, ps, pb, spw, sps, spb],
+                    template=tmpl, grid=(nth, D // nb, NT), threadgroup=(nth, 1, 1),
+                    output_shapes=[(T * (topk + 1), D)], output_dtypes=[mx.float32])
+    y = part.reshape(T, topk + 1, D).sum(axis=1)
+    return y.astype(out_dtype or h.dtype)
+
+# ---- nsd/resolve.py
+"""Finding the model and the MTP head on disk.
+
+For an HF repo id `<org>/<name>`, in order:
+
+  1. a local path always wins (the argument is an existing directory)
+  2. LM Studio's model directories: `~/.lmstudio/models/<org>/<name>`, then
+     `~/.cache/lm-studio/models/<org>/<name>`
+  3. the Hugging Face cache
+  4. `huggingface_hub.snapshot_download`
+
+so a machine that already has the 17.7 GB checkpoint in LM Studio does not download it
+again, and a machine without it gets it with no extra steps.
+"""
+import os
+
+from huggingface_hub import snapshot_download
+
+DEFAULT_MODEL_ID = "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit"
+DEFAULT_MTP_HEAD_ID = "sevren-ai/nemotron-3.5-lightning-mtp-head-mlx-4bit"
+
+
+def resolve_repo(id_or_path, default_id=None, download=True):
+    """-> a local directory holding the model / head, or None when nothing is on disk and
+    download is False. `id_or_path` may be None (use the default id), a local directory,
+    or an HF repo id."""
+    repo = id_or_path or default_id
+    if os.path.isdir(repo):
+        return repo
+    parts = repo.split("/")
+    if len(parts) != 2:
+        raise FileNotFoundError(f"{repo!r} is neither an existing directory nor an HF repo id org/name")
+    org, name = parts
+    home = os.path.expanduser("~")
+    for d in (os.path.join(home, ".lmstudio", "models", org, name),
+              os.path.join(home, ".cache", "lm-studio", "models", org, name)):
+        if os.path.isdir(d):
+            return d
+    try:
+        return snapshot_download(repo, local_files_only=True)
+    except Exception:
+        pass
+    if not download:
+        return None
+    print(f"downloading {repo} ...", flush=True)
+    return snapshot_download(repo)
+
+
+def resolve_model(id_or_path=None, download=True):
+    """The 4-bit checkpoint (default: mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit)."""
+    return resolve_repo(id_or_path, DEFAULT_MODEL_ID, download)
+
+
+def resolve_head(id_or_path=None, download=True):
+    """The standalone MTP head (default: sevren-ai/nemotron-3.5-lightning-mtp-head-mlx-4bit,
+    772 MB: mtp_head.safetensors plus its config)."""
+    return resolve_repo(id_or_path, DEFAULT_MTP_HEAD_ID, download)
+
+# ---- nsd/runtime.py
+"""Runtime facts for run records: the device, the MLX version, this repository's git
+commit, and a UTC timestamp. Shared by the CLI and the benchmark scripts so every JSON
+record carries the same fields."""
+import os
+import subprocess
+from datetime import datetime, timezone
+
+import mlx.core as mx
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def git_commit():
+    """This repository's short commit hash (git rev-parse), blank outside a repo or
+    without git. Runs against the repository this file is installed from, so it works
+    from any working directory."""
+    try:
+        out = subprocess.run(["git", "-C", REPO_ROOT, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        return out.split()[0] if out else ""
+    except Exception:
+        return ""
+
+
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def record_meta():
+    """The common record fields: device name, its memory, the MLX version, the repo
+    commit (blank when unavailable) and a UTC timestamp."""
+    dev = mx.device_info()
+    return dict(device=dev.get("device_name"), memory_gb=dev.get("memory_size", 0) / 1e9,
+                mlx=mx.__version__, git=git_commit(), utc=utc_now())
+
+# ---- tests/__init__.py
+
+
+# ---- tests/conftest.py
+"""Shared fixtures for the test suite. The tests need the real 17.7 GB checkpoint (and the
+MTP head for the end-to-end speculative test); when they are not on disk they are skipped
+with a message rather than downloading."""
+import os
+
+import mlx.core as mx
+import pytest
+
+from nsd.resolve import resolve_head, resolve_model
+
+
+def _model_dir():
+    return resolve_model(download=False)
+
+
+def _head_dir():
+    return resolve_head(download=False)
+
+
+@pytest.fixture(scope="session")
+def model_dir():
+    d = _model_dir()
+    if d is None:
+        pytest.skip("the 4-bit checkpoint is not on disk; get it with "
+                    "`hf download mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` "
+                    "(or point --model at an LM Studio copy)")
+    return d
+
+
+@pytest.fixture(scope="session")
+def head_dir():
+    d = _head_dir()
+    if d is None:
+        pytest.skip("the MTP head is not on disk; get it with "
+                    "`hf download sevren-ai/nemotron-3.5-lightning-mtp-head-mlx-4bit`")
+    return d
+
+
+@pytest.fixture(scope="session")
+def wired():
+    """Set the wired memory limit to the device's recommended working set, as the model
+    wrapper does; ignore machines / versions where that is not allowed."""
+    try:
+        mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+    except Exception:
+        pass
+
+# ---- tests/test_end_to_end.py
+"""End to end, in one process (dense first: the sparse conversion is one-way):
+
+  1. dense mode reproduces `mlx_lm`'s own greedy generation token for token (the same
+     blocks, the same ops, so bit-identical)
+  2. sparse mode (neuron-major down, checkpoint layout freed) matches dense for at least
+     the first 10 tokens; the two may diverge later on an argmax near-tie
+  3. MTP speculative decoding (k=2 drafts) produces the same text as plain sparse decode,
+     again up to a near-tie
+
+    python -m pytest tests/test_end_to_end.py -v -s
+    python -m tests.test_end_to_end
+"""
+import json
+import os
+
+import mlx.core as mx
+import pytest
+
+from nsd.model import NemotronModel
+from nsd.mtp import MTPHead
+from nsd.resolve import resolve_head
+
+MAX_TOKENS = 24
+MATCH_AT_LEAST = 10
+eos = {2}             # replaced inside the `loaded` fixture from the model's generation_config
+
+
+def take_ids(model, prompt, n, temp=0.0, mtp=None, n_draft=0):
+    """All n generated token ids, without the end-of-sequence token (mlx-lm's generate
+    stops before yielding it; our loop yields it). The last token arrives with the stats,
+    so the stats' own token list is the authoritative one."""
+    gen = (model.generate_mtp(prompt, mtp, n_draft=n_draft, max_tokens=n) if mtp
+           else model.generate(prompt, n, temp))
+    stats = None
+    for t, st in gen:
+        if st is not None:
+            stats = st
+    return [t for t in stats["tokens"] if t not in eos], stats
+
+
+@pytest.fixture(scope="module")
+def loaded(model_dir, head_dir, wired):
+    """The model, dense first; also the chat prompt and mlx-lm's own greedy tokens for it."""
+    global eos
+    model = NemotronModel(model_dir, mode="dense", verbose=False)
+    e = json.load(open(os.path.join(model.path, "generation_config.json"))).get("eos_token_id", 2)
+    eos = set(tuple(e) if isinstance(e, list) else (e,))
+    text = "Write two sentences about the sea."
+    prompt = list(model.tokenizer.apply_chat_template([{"role": "user", "content": text}],
+                                                      add_generation_prompt=True, enable_thinking=False))
+    from mlx_lm.generate import stream_generate
+    ref = [int(r.token) for r in stream_generate(model.model, model.tokenizer, prompt, max_tokens=MAX_TOKENS)]
+    return model, prompt, ref
+
+
+def test_dense_reproduces_mlx_lm_greedy(loaded):
+    """(1) our dense decode loop against mlx-lm's own generate, same prompt, greedy."""
+    model, prompt, ref = loaded
+    out, stats = take_ids(model, prompt, MAX_TOKENS)
+    n = min(len(out), len(ref))
+    same = next((i for i in range(n) if out[i] != ref[i]), n)
+    print(f"  dense vs mlx_lm.generate: identical for the first {same}/{n} tokens "
+          f"({stats['decode_tps']:.1f} tok/s ours)")
+    assert out == ref, (out, ref)
+
+
+def test_sparse_matches_dense(loaded):
+    """(2) sparse mode: the same tokens as dense for at least the first MATCH_AT_LEAST
+    tokens (argmax near-ties can flip later)."""
+    model, prompt, ref = loaded
+    model.set_mode("sparse")
+    out, stats = take_ids(model, prompt, MAX_TOKENS)
+    n = min(len(out), len(ref))
+    same = next((i for i in range(n) if out[i] != ref[i]), n)
+    print(f"  sparse vs dense: identical for the first {same}/{n} tokens "
+          f"({stats['decode_tps']:.1f} tok/s sparse, peak {stats['peak_gb']:.1f} GB)")
+    assert same >= MATCH_AT_LEAST, (same, out, ref)
+    print(f"  text: {model.tokenizer.decode(out)!r}")
+
+
+def test_mtp_matches_plain_sparse(loaded):
+    """(3) MTP speculative decoding (k=2) against plain sparse decode: same text, up to a
+    near-tie; and the acceptance statistics come back with the run."""
+    model, prompt, ref = loaded
+    if model.mode != "sparse":
+        model.set_mode("sparse")
+    plain, _ = take_ids(model, prompt, MAX_TOKENS)
+    mtp = MTPHead(model, resolve_head(download=False))
+    out, stats = take_ids(model, prompt, MAX_TOKENS, mtp=mtp, n_draft=2)
+    n = min(len(out), len(plain))
+    same = next((i for i in range(n) if out[i] != plain[i]), n)
+    sp = stats["spec"]
+    print(f"  mtp(k=2) vs plain sparse: identical for the first {same}/{n} tokens | "
+          f"{sp['steps']} steps, {sp['tokens_per_step']:.2f} tok/step, accepted {sp['accepted_mean']:.2f}, "
+          f"hist {sp['accepted_hist']} | {stats['decode_tps']:.1f} tok/s")
+    assert same >= MATCH_AT_LEAST, (same, out, plain)
+    assert model.tokenizer.decode(out) == model.tokenizer.decode(plain[:same])
+
+
+def main():
+    import sys
+    sys.exit(__import__("pytest").main([__file__, "-v", "-s"]))
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- tests/test_layout_decode.py
+"""The layout permutation is exact and self-inverse, and the sparse decode kernel matches
+an fp32 dequantised reference on one MoE layer's real weights.
+
+Run with pytest, or as a module:
+
+    python -m pytest tests/test_layout_decode.py -v
+    python -m tests.test_layout_decode
+"""
+import json
+import os
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+import pytest
+
+from nsd.decode import sparse_down
+from nsd.layout import nibble_transpose, to_neuron_major
+
+GS, BITS, TOPK = 64, 4, 6
+LAYER = 10          # a MoE layer of the 52
+
+
+def load_moe_layer(model_dir, l=LAYER):
+    """One MoE layer's quantised tensors straight from the checkpoint's safetensors."""
+    idx = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
+    p = f"backbone.layers.{l}.mixer"
+    need = [f"{p}.switch_mlp.fc1.{k}" for k in ("weight", "scales", "biases")] \
+        + [f"{p}.switch_mlp.fc2.{k}" for k in ("weight", "scales", "biases")] \
+        + [f"{p}.shared_experts.{n}.{k}" for n in ("up_proj", "down_proj") for k in ("weight", "scales", "biases")]
+    W = {}
+    for fn in sorted(set(idx[k] for k in need)):
+        d = mx.load(os.path.join(model_dir, fn))
+        W.update({k: d[k] for k in need if k in d})
+    return W
+
+
+def nibble_transpose_np(w):
+    """A slow numpy reference of the nibble transpose: unpack every word to 8 nibbles, move
+    them, pack them again."""
+    lead = w.shape[:-2]
+    R, CW = w.shape[-2], w.shape[-1]
+    C = CW * 8
+    a = np.asarray(w)                                      # uint32 [.., R, CW]
+    nib = np.zeros((*lead, R, C), dtype=np.uint32)
+    for b in range(8):
+        nib[..., b::8] = (a >> np.uint32(4 * b)) & np.uint32(0xF)
+    w2 = nib.transpose(*range(len(lead)), -1, -2)          # [.., C, R]  W[c, r]
+    out = np.zeros((*lead, C, R // 8, 8), dtype=np.uint32)
+    for b in range(8):
+        out[..., b] = w2[..., b::8] << np.uint32(4 * b)
+    return mx.array(out.sum(axis=-1).astype(np.uint32))
+
+
+def test_nibble_transpose_exact_and_self_inverse():
+    """Against the numpy reference on random words, and nibble_transpose o nibble_transpose
+    = identity, over shapes that cover both the checkpoint's down layout and its transpose."""
+    mx.random.seed(0)
+    for shape in ((5, 24, 9), (2688, 232), (1856, 336), (3712, 336), (3, 2688, 232)):
+        w = mx.random.randint(0, 2**32, shape, dtype=mx.uint32)
+        t = nibble_transpose(w)
+        mx.eval(t)
+        assert t.shape == (*shape[:-2], shape[-1] * 8, shape[-2] // 8), t.shape
+        assert mx.array_equal(t, nibble_transpose_np(w)), f"transpose wrong at {shape}"
+        back = nibble_transpose(t)
+        assert back.shape == w.shape
+        assert mx.array_equal(back, w), f"not self-inverse at {shape}"
+
+
+def test_to_neuron_major_is_the_same_bytes(model_dir):
+    """The permutation moves the checkpoint's own bytes: dequantising the neuron-major
+    layout must give exactly the same fp32 weights as dequantising the original."""
+    W = load_moe_layer(model_dir)
+    dn_w, dn_s, dn_b = (W[f"backbone.layers.{LAYER}.mixer.switch_mlp.fc2.{k}"] for k in ("weight", "scales", "biases"))
+    E, D = dn_w.shape[0], dn_w.shape[1]
+    pw, ps, pb = to_neuron_major(dn_w, dn_s, dn_b)
+    assert pw.shape == (E, dn_w.shape[2] * 8, D // 8)
+    assert ps.shape == (E, dn_w.shape[2] * 8 // GS, D)
+    ref = mx.dequantize(dn_w, dn_s, dn_b, group_size=GS, bits=BITS)
+    # rebuild W from the transposed words: word w of row i packs W[8w..8w+7, i]
+    pw3 = nibble_transpose(pw)                            # back to [E, D, F/8]
+    out = mx.dequantize(pw3, mx.swapaxes(ps, -1, -2), mx.swapaxes(pb, -1, -2), group_size=GS, bits=BITS)
+    assert mx.array_equal(out.astype(mx.float32), ref.astype(mx.float32))
+
+
+@pytest.fixture(scope="module")
+def layer_weights(model_dir):
+    return load_moe_layer(model_dir)
+
+
+@pytest.fixture(scope="module")
+def decode_case(model_dir, wired, layer_weights):
+    """One MoE layer's real weights, with a neuron-major layout and random inputs that have
+    realistic sparsity (random x through the real 4-bit up projections, then ReLU2)."""
+    p = f"backbone.layers.{LAYER}.mixer"
+    up_w, up_s, up_b = (layer_weights[f"{p}.switch_mlp.fc1.{k}"] for k in ("weight", "scales", "biases"))
+    dn_w, dn_s, dn_b = (layer_weights[f"{p}.switch_mlp.fc2.{k}"] for k in ("weight", "scales", "biases"))
+    su_w, su_s, su_b = (layer_weights[f"{p}.shared_experts.up_proj.{k}"] for k in ("weight", "scales", "biases"))
+    sd_w, sd_s, sd_b = (layer_weights[f"{p}.shared_experts.down_proj.{k}"] for k in ("weight", "scales", "biases"))
+    E, F, D = up_w.shape[0], up_w.shape[1], dn_w.shape[1]
+    FS = su_w.shape[0]
+    pw, ps, pb = to_neuron_major(dn_w, dn_s, dn_b)
+    spw, sps, spb = to_neuron_major(sd_w, sd_s, sd_b)
+    mx.eval(pw, ps, pb, spw, sps, spb)
+    print(f"  layer {LAYER}: E={E} F={F} D={D} FS={FS}")
+    return dict(up=(up_w, up_s, up_b), dn=(dn_w, dn_s, dn_b), su=(su_w, su_s, su_b), sd=(sd_w, sd_s, sd_b),
+                pw=(pw, ps, pb), spw=(spw, sps, spb), E=E, F=F, D=D, FS=FS)
+
+
+def make_inputs(case, B, seed=0):
+    """Random x, real up projections, ReLU2: h with the sparsity the kernel exploits."""
+    mx.random.seed(seed)
+    x = (mx.random.normal((B, case["D"])) * 0.5).astype(mx.bfloat16)
+    inds = mx.stack([mx.random.permutation(case["E"])[:TOPK] for _ in range(B)]).astype(mx.int32)
+    scores = mx.random.uniform(shape=(B, TOPK)).astype(mx.float32)
+    up_w, up_s, up_b = case["up"]
+    su_w, su_s, su_b = case["su"]
+    u = mx.gather_qmm(x[:, None, None, :], up_w, up_s, up_b, rhs_indices=inds, transpose=True,
+                      group_size=GS, bits=BITS)
+    h = mx.square(nn.relu(u))                                     # [B, TOPK, 1, F]
+    hs = mx.square(nn.relu(mx.quantized_matmul(x, su_w, su_s, su_b, transpose=True, group_size=GS, bits=BITS)))
+    hcat = mx.concatenate([h.reshape(B, TOPK * case["F"]), hs], axis=1)
+    gains = mx.concatenate([scores, mx.ones((B, 1))], axis=1)
+    mx.eval(hcat, inds, gains, h, hs, scores)
+    return x, inds, scores, h, hs, hcat, gains
+
+
+def reference(case, h, hs, inds, scores):
+    """The fp32 reference: dequantise the down projections and form the products in fp32."""
+    B = h.shape[0]
+    F, D, FS = case["F"], case["D"], case["FS"]
+    hf = h.astype(mx.float32).squeeze(-2)                         # [B, TOPK, F]
+    dn_w, dn_s, dn_b = case["dn"]
+    sd_w, sd_s, sd_b = case["sd"]
+    Wd = mx.dequantize(dn_w, dn_s, dn_b, group_size=GS, bits=BITS).astype(mx.float32)   # [E, D, F]
+    Wsd = mx.dequantize(sd_w, sd_s, sd_b, group_size=GS, bits=BITS).astype(mx.float32)
+    ref = mx.zeros((B, D))
+    for b in range(B):
+        for k in range(TOPK):
+            ref[b] = ref[b] + scores[b, k] * (Wd[inds[b, k]] @ hf[b, k])
+        ref[b] = ref[b] + Wsd @ hs[b].astype(mx.float32)
+    return ref
+
+
+def mlx_reference(case, h, hs, inds, scores):
+    """What MLX itself computes on the checkpoint layout (bf16 gather_qmm)."""
+    dn_w, dn_s, dn_b = case["dn"]
+    sd_w, sd_s, sd_b = case["sd"]
+    y = mx.gather_qmm(h, dn_w, dn_s, dn_b, rhs_indices=inds, transpose=True, group_size=GS, bits=BITS)
+    return (y.squeeze(-2) * scores[..., None].astype(y.dtype)).sum(-2) \
+        + mx.quantized_matmul(hs, sd_w, sd_s, sd_b, transpose=True, group_size=GS, bits=BITS)
+
+
+# slice / unroll / output-chunk settings that must all give the same answer
+SWEEP = ((64, 2, 1), (64, 1, 3), (928, 2, 1), (928, 2, 3), (1856, 2, 3), (1856, 4, 2), (32, 2, 1))
+
+
+@pytest.mark.parametrize("B", [1, 4])
+def test_sparse_down_matches_fp32_reference(decode_case, B):
+    """The kernel against the fp32 dequantised reference for several slice / unroll / chunk
+    settings; also the error against MLX's own bf16 gather_qmm (reported, not asserted:
+    it is the bf16 rounding of the same products)."""
+    case = decode_case
+    x, inds, scores, h, hs, hcat, gains = make_inputs(case, B)
+    ref32 = reference(case, h, hs, inds, scores)
+    ref_mlx = mlx_reference(case, h, hs, inds, scores)
+    mx.eval(ref32, ref_mlx)
+    live = float((hcat != 0).mean().item())
+    worst32 = 0.0
+    for sl, unr, nds in SWEEP:
+        out = sparse_down(hcat, inds, gains, *case["pw"], *case["spw"],
+                          F=case["F"], FS=case["FS"], D=case["D"], topk=TOPK,
+                          sl=sl, unr=unr, nds=nds, out_dtype=mx.float32)
+        mx.eval(out)
+        r32 = ref32.astype(mx.float32)
+        e32 = float((out - r32).abs().max() / r32.abs().max())
+        rml = ref_mlx.astype(mx.float32)
+        e_mlx = float((out - rml).abs().max() / rml.abs().max())
+        worst32 = max(worst32, e32)
+        print(f"  B={B} live {100 * live:.1f}%  sl={sl} unr={unr} nds={nds}: "
+              f"max rel err vs fp32 dequant {e32:.2e}, vs MLX bf16 {e_mlx:.2e}")
+        assert e32 < 2e-3, (sl, unr, nds, e32)
+    # the same products in MLX's own bf16 order, for scale
+    e_mlx_ref = float((mlx_reference(case, h, hs, inds, scores).astype(mx.float32) - ref32).abs().max() / ref32.abs().max())
+    print(f"  B={B}: worst kernel err {worst32:.2e} (bound 2e-3); MLX bf16 gather_qmm err {e_mlx_ref:.2e}")
+
+
+def main():
+    import sys
+    sys.exit(__import__("pytest").main([__file__, "-v", "-s"]))
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- tests/test_prefill_kernel.py
+"""The matrix-unit prefill kernel matches MLX's dense block on a 2048-token chunk of real
+activations, at the bf16 level.
+
+Loads the full model with BOTH down layouts resident (the production wrapper frees the
+checkpoint's one; the comparison needs them), runs 2048 tokens of Moby Dick through the
+model to capture a MoE layer's input residual stream, then runs the same chunk through
+the stock block and through the sparse kernel.
+
+    python -m pytest tests/test_prefill_kernel.py -v -s
+    python -m tests.test_prefill_kernel
+"""
+import os
+
+import mlx.core as mx
+import pytest
+
+from nsd.model import NemotronModel
+
+NTOK = 2048
+ERR_BOUND = 5e-3          # relative error at the bf16 level
+
+
+def moby_ids(model, n=NTOK):
+    text = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "texts", "moby_dick.txt"), encoding="utf-8", errors="replace").read()
+    ids = model.tokenizer.encode(text, add_special_tokens=False)
+    return [1] + list(ids[2000:2000 + n - 1])
+
+
+@pytest.fixture(scope="module")
+def captured(model_dir, wired):
+    """The model with both layouts resident, and the residual stream entering one MoE layer
+    on a real 2048-token pass."""
+    layer = 10
+    model = NemotronModel(model_dir, mode="sparse", verbose=False, single_layout=False)
+    blk = model.blocks[layer]
+    caps = {}
+    orig = blk.prefill
+
+    def prefill_capture(x):
+        caps.setdefault("x", []).append(x)
+        return orig(x)
+
+    blk.prefill = prefill_capture
+    ids = mx.array(moby_ids(model), dtype=mx.int32)
+    model.prefill(ids, model.make_cache(), chunk=NTOK)
+    blk.prefill = orig
+    x = caps["x"][0]
+    mx.eval(x)
+    print(f"  captured layer {layer} on {x.shape[0]} real tokens")
+    return model, blk, x
+
+
+def test_prefill_kernel_matches_dense_block(captured):
+    model, blk, x = captured
+    T = x.shape[0]
+    assert T == NTOK
+    ref = blk.block(x[None])[0]                  # the stock block: mlx-lm's own sorted gather_qmm
+    out = blk.prefill_sparse(x)                  # our kernel: tile order, union, gather, GEMM
+    ref32, out32 = ref.astype(mx.float32), out.astype(mx.float32)
+    mx.eval(ref32, out32)
+    err = float((out32 - ref32).abs().max() / ref32.abs().max())
+    live = float((blk.pack(*blk.front(x))[0] != 0).mean().item())
+    print(f"  live neurons {100 * live:.1f}%  max rel err vs MLX dense block: {err:.2e} (bound {ERR_BOUND:.0e})")
+    assert err < ERR_BOUND, err
+
+
+def test_prefill_kernel_tt_variants(captured):
+    """The 32- and 64-slot tile settings (the dense layers use 64) agree with the dense
+    block too."""
+    model, blk, x = captured
+    ref = blk.block(x[None])[0].astype(mx.float32)
+    for tt in (32, 64):
+        blk.prefill_kw["tt"] = tt
+        out = blk.prefill_sparse(x).astype(mx.float32)
+        mx.eval(out)
+        err = float((out - ref).abs().max() / ref.abs().max())
+        print(f"  tt={tt}: max rel err vs MLX dense block {err:.2e}")
+        assert err < ERR_BOUND, (tt, err)
+
+
+def main():
+    import sys
+    sys.exit(__import__("pytest").main([__file__, "-v", "-s"]))
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- tests/test_runtime.py
+"""The run-record metadata every benchmark JSON and the CLI record carry: the device, the
+MLX version, this repository's short commit hash (blank when unavailable) and a UTC
+timestamp. No model needed."""
+import re
+import subprocess
+
+from nsd.runtime import git_commit, record_meta, utc_now
+
+
+def test_record_meta_fields():
+    m = record_meta()
+    assert set(m) == {"device", "memory_gb", "mlx", "git", "utc"}
+    assert m["device"]           # a name, e.g. "Apple M5 Pro"
+    assert m["memory_gb"] > 0
+    assert re.match(r"^\d+\.\d+\.\d+", m["mlx"])
+    assert re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z$", m["utc"])
+
+
+def test_utc_now_is_utc():
+    assert utc_now().endswith("Z")
+
+
+def test_git_commit_matches_repo():
+    """Inside this repository the hash matches git rev-parse; the helper never raises."""
+    c = git_commit()
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                             text=True, timeout=10).stdout.strip()
+    except Exception:
+        return                          # no git available; the helper must still return a string
+    assert c == out.split()[0] if out else c == ""
+
+
+def main():
+    import sys
+    sys.exit(__import__("pytest").main([__file__, "-v", "-s"]))
+
+
+if __name__ == "__main__":
+    main()
+
+# ---- tests/test_verify_rollback.py
+"""The multi-row verify step computes what B single decode steps compute, and the rollback
+puts the caches where B single steps would have left them.
+
+On a real prompt, with the model in sparse mode (the production configuration):
+
+  1. verify_step on B rows  vs  B single steps: logits (argmax agreement and relative
+     difference per position), the final residual stream, and the caches (Mamba states,
+     conv states, KV caches)
+  2. verify_step on B rows, rollback to N, then the remaining B-N rows as single steps:
+     the same end state as (1)
+  3. verify_step on B rows then rollback to N  vs  N single steps directly
+
+The two paths form the same products in a different order (one multi-row GEMM and scan vs
+B single-row ones), so differences sit at the bf16 level; an argmax can flip on a near-tie.
+
+    python -m pytest tests/test_verify_rollback.py -v -s
+    python -m tests.test_verify_rollback
+"""
+import copy
+
+import mlx.core as mx
+import pytest
+
+from nsd.model import NemotronModel
+
+B = 4
+N = 2                       # rollback target: keep N of the B rows
+PROMPT = ("Whales are not fish because they are warm-blooded mammals that breathe air "
+          "through lungs, unlike fish, which")
+# bf16-level bounds: the two paths share their products and differ in summation order only,
+# so the differences are measured against the largest magnitude across all layers, not
+# per layer (a single layer's conv state can sit entirely near zero). The conv state and
+# KV cache inherit the residual stream's own difference (~1.4e-2 here); the Mamba state,
+# which the rollback recomputes, stays an order below it.
+RESID_BOUND = 5e-2
+CACHE_BOUND = 5e-2
+
+
+def clone_cache(cache):
+    out = []
+    for c in cache:
+        if c is None:
+            out.append(None)
+            continue
+        d = copy.copy(c)
+        if hasattr(c, "cache"):                              # ArraysCache (Mamba-2)
+            d.cache = [None if s is None else mx.array(s) for s in c.cache]
+        else:                                                # KVCache (attention)
+            d.keys = None if c.keys is None else mx.array(c.keys)
+            d.values = None if c.values is None else mx.array(c.values)
+        out.append(d)
+    return out
+
+
+def rel(a, b):
+    a = a.astype(mx.float32)
+    b = b.astype(mx.float32)
+    return float((a - b).abs().max() / (b.abs().max() + 1e-12))
+
+
+def run_single_steps(model, cache0, xin, n):
+    """n single decode steps from a clone of cache0 -> (residual [n, D], logits [n, V], cache)."""
+    c = clone_cache(cache0)
+    model._cache = c
+    xs, ls = [], []
+    for i in range(n):
+        x = model.step(xin[i:i + 1])
+        xs.append(x)
+        ls.append(model.logits(x).astype(mx.float32))
+    mx.eval(*xs, *ls, *[s for cc in c if cc is not None for s in cc.state])
+    return mx.concatenate(xs), mx.concatenate(ls), c
+
+
+def compare_caches(model, ca, cb, label):
+    """The caches after the same tokens by two paths. Differences are accumulated globally:
+    max |a - b| over every layer, divided by max |b| over every layer."""
+    diff = {"mamba_state": 0.0, "conv": 0.0, "kv": 0.0}
+    mag = {"mamba_state": 1e-12, "conv": 1e-12, "kv": 1e-12}
+    for l, t in enumerate(model.types):
+        if t == "mamba":
+            for i, k in ((0, "conv"), (1, "mamba_state")):
+                a = ca[l][i].astype(mx.float32)
+                b = cb[l][i].astype(mx.float32)
+                diff[k] = max(diff[k], float((a - b).abs().max()))
+                mag[k] = max(mag[k], float(b.abs().max()))
+        elif t == "attention":
+            assert ca[l].offset == cb[l].offset, (l, ca[l].offset, cb[l].offset)
+            o = ca[l].offset
+            for x, y in ((ca[l].keys[..., :o, :], cb[l].keys[..., :o, :]),
+                         (ca[l].values[..., :o, :], cb[l].values[..., :o, :])):
+                a = x.astype(mx.float32)
+                b = y.astype(mx.float32)
+                diff["kv"] = max(diff["kv"], float((a - b).abs().max()))
+                mag["kv"] = max(mag["kv"], float(b.abs().max()))
+    worst = {k: diff[k] / mag[k] for k in diff}
+    print(f"  {label}: max relative diff (global)  mamba state {worst['mamba_state']:.2e}  "
+          f"conv state {worst['conv']:.2e}  kv {worst['kv']:.2e}")
+    for k, v in worst.items():
+        assert v < CACHE_BOUND, (k, v)
+    return worst
+
+
+@pytest.fixture(scope="module")
+def setup(model_dir, wired):
+    model = NemotronModel(model_dir, mode="sparse", verbose=False)
+    ids = [1] + model.tokenizer.encode(PROMPT, add_special_tokens=False)
+    prompt, cont = ids[:-B], ids[-B:]
+    cache0 = model.make_cache()
+    h = model.prefill(mx.array(prompt, dtype=mx.int32), cache0)
+    mx.eval(h)
+    x0 = model.embed(mx.array(cont[:1], dtype=mx.int32))                 # the anchor row
+    toks = mx.array(cont[1:], dtype=mx.int32)                           # B-1 "drafts" (the true continuation)
+    xin = mx.concatenate([x0, model.embed(toks)])                      # [B, D]
+    mx.eval(xin)
+    return model, cache0, xin
+
+
+def test_verify_equals_b_single_steps(setup):
+    """(1) one verify step on B rows vs B single decode steps: same logits, same residual
+    stream, same caches."""
+    model, cache0, xin = setup
+    resid_b, logits_b, cb = run_single_steps(model, cache0, xin, B)
+
+    ca = clone_cache(cache0)
+    xa = model.verify_step(xin, ca)
+    logits_a = model.logits(xa).astype(mx.float32)
+    mx.eval(xa, logits_a, *[s for c in ca if c is not None for s in c.state])
+
+    agree = int((mx.argmax(logits_a, -1) == mx.argmax(logits_b, -1)).sum().item())
+    per_pos = " ".join(f"{rel(logits_a[i], logits_b[i]):.2e}" for i in range(B))
+    resid = rel(xa, resid_b)
+    print(f"  B={B}: argmax agree {agree}/{B} | per-position logits rel diff {per_pos} "
+          f"| final residual rel diff {resid:.2e}")
+    assert agree == B, "an argmax flipped between the multi-row and single-row paths (near-tie)"
+    assert resid < RESID_BOUND, resid
+    compare_caches(model, ca, cb, f"caches after the {B} tokens")
+
+
+def test_rollback_then_single_steps(setup):
+    """(2) verify(B) -> rollback to N -> single steps for the rest: same end state as (1)."""
+    model, cache0, xin = setup
+    resid_b, logits_b, cb = run_single_steps(model, cache0, xin, B)
+    cc = clone_cache(cache0)
+    model.verify_step(xin, cc)
+    model.rollback(cc, N, B)
+    mx.eval(*[s for c in cc if c is not None for s in c.state])
+    model._cache = cc
+    for i in range(N, B):
+        mx.eval(model.step(xin[i:i + 1]))
+    compare_caches(model, cc, cb, f"caches after verify({B}) -> rollback to {N} -> {B - N} single steps")
+
+
+def test_rollback_equals_n_single_steps(setup):
+    """(3) verify(B) -> rollback to N  vs  N single steps directly."""
+    model, cache0, xin = setup
+    resid_d, logits_d, cd = run_single_steps(model, cache0, xin, N)
+    ce = clone_cache(cache0)
+    model.verify_step(xin, ce)
+    model.rollback(ce, N, B)
+    mx.eval(*[s for c in ce if c is not None for s in c.state])
+    compare_caches(model, ce, cd, f"caches after verify({B}) -> rollback to {N}  vs  {N} single steps")
+
+
+def main():
+    import sys
+    sys.exit(__import__("pytest").main([__file__, "-v", "-s"]))
+
+
+if __name__ == "__main__":
+    main()
+
